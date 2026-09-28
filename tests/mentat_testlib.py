@@ -328,10 +328,13 @@ class Daemon:
         _children.append(self.proc)
 
     def wait_up(self, timeout=10):
+        # The HTTP port opens after the control port, and callers read
+        # /status next.
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                socket.create_connection(("127.0.0.1", self.port), timeout=1).close()
+                for port in (self.port, self.http_port):
+                    socket.create_connection(("127.0.0.1", port), timeout=1).close()
                 return self
             except OSError:
                 time.sleep(0.05)
