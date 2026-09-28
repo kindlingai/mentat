@@ -208,9 +208,15 @@ build_serve()
 cluster = Cluster()
 mA = FakeModel("model-a", "tool_a")
 mB = FakeModel("model-b", "tool_b")
+META_FILE = os.path.join(cluster.tmp, "meta.json")
+with open(META_FILE, "w") as f:
+    json.dump({"image.base": "cuda:12.8", "image": "overridden", "layers": 14}, f)
 cluster.start_agent("ga", container="ca", env_extra={
     "MENTAT_OPENAI_API": f"http://127.0.0.1:{mA.port}/v1",
     "MENTAT_MCP_API": f"http://127.0.0.1:{mA.port}/mcp",
+    "MENTAT_META_FILE": META_FILE,
+    "MENTAT_META_IMAGE": "vllm:0.11",
+    "MENTAT_META_BAD+KEY": "dropped",
 })
 cluster.start_agent("gb", container="cb", env_extra={
     "MENTAT_OPENAI_API": f"http://127.0.0.1:{mB.port}/v1",
@@ -335,6 +341,22 @@ def t01_announcement_reaches_status():
             m.port,
             "/mcp",
         ), svc
+
+
+def t01b_agent_meta_reaches_status():
+    # The file, then the variables, which override it. A key outside the
+    # key syntax is dropped.
+    agent = list(cluster.status_json()["groups"]["ga"]["agents"].values())[0]
+    meta = agent["meta"]
+    assert meta["image"] == "vllm:0.11", meta
+    assert meta["image.base"] == "cuda:12.8", meta
+    assert meta["layers"] == "14", meta
+    assert "bad+key" not in meta, meta
+    if sys.platform.startswith("linux"):
+        assert meta.get("kernel"), meta
+    # An agent that sets nothing still has the field.
+    agent = list(cluster.status_json()["groups"]["gb"]["agents"].values())[0]
+    assert isinstance(agent["meta"], dict), agent
 
 
 def t02_no_actors_yet_admits_on_the_probe_and_merges_mcp():
@@ -843,7 +865,8 @@ def t11_a_registration_with_no_actors_is_served():
              "MENTAT_GROUP": "gs",
              "CONTAINER_NAME": "cs",
              "MENTAT_OPENAI_API": f"http://127.0.0.1:{mS.port}/v1",
-             "MENTAT_MODEL_PROVIDER": "vllm"},
+             "MENTAT_MODEL_PROVIDER": "vllm",
+             "MENTAT_META_IMAGE": "stub:1"},
     )
     tl._children.append(reg)
     # Short enough that the retirement below fits in a test run, long enough
@@ -859,6 +882,7 @@ def t11_a_registration_with_no_actors_is_served():
     # `provider` rides on the openai entry now, since it describes what
     # serves that endpoint.
     assert agents[0]["services"]["openai"]["provider"] == "vllm", agents
+    assert agents[0]["meta"] == {"image": "stub:1"}, agents
     assert d.status_json()["groups"]["gs"]["actors"] == {}, "the stub hosts no actors"
 
 
@@ -907,6 +931,7 @@ def t13_an_mcp_only_group_is_listed_under_mcp():
 def main():
     tests = [
         t01_announcement_reaches_status,
+        t01b_agent_meta_reaches_status,
         t02_no_actors_yet_admits_on_the_probe_and_merges_mcp,
         t03_admit_on_running_actor,
         t04_routing_by_model_name,

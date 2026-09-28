@@ -52,6 +52,7 @@ pub fn agent_row(st: &State, a: &crate::state::AgentInfo) -> Value {
         "machine": a.machine,
         "gpus_free": st.free_gpus_of(&a.id),
         "services": a.services,
+        "meta": a.meta,
         "pid": a.pid,
     })
 }
@@ -282,6 +283,24 @@ pub fn snapshot(st: &State, scope: Option<&str>) -> Value {
     })
 }
 
+/// An agent's `meta` as one indented `key=value` line, or None when it has
+/// none. A value with a space or a quote is written as a quoted string.
+fn meta_line(meta: &Value) -> Option<String> {
+    let m = meta.as_object().filter(|m| !m.is_empty())?;
+    let cells: Vec<String> = m
+        .iter()
+        .map(|(k, v)| {
+            let v = v.as_str().unwrap_or_default();
+            if v.is_empty() || v.contains([' ', '"', '=']) {
+                format!("{k}={v:?}")
+            } else {
+                format!("{k}={v}")
+            }
+        })
+        .collect();
+    Some(format!("    meta {}\n", cells.join(" ")))
+}
+
 /// Render a snapshot for terminals. `scoped` mirrors whether the query was
 /// group-scoped. Only then does it print the ray-compatible GPU line.
 pub fn render(data: &Value, scoped: bool) -> String {
@@ -399,6 +418,12 @@ pub fn render(data: &Value, scoped: bool) -> String {
                     ""
                 },
             ));
+            // `ray status` prints the scoped form, and entrypoints grep it for
+            // the GPU line. A meta value is free text and could match that
+            // line.
+            if let Some(line) = meta_line(&a["meta"]).filter(|_| !scoped) {
+                out.push_str(&line);
+            }
         }
         for (id, p) in g["placement_groups"].as_object().into_iter().flatten() {
             out.push_str(&format!(
@@ -458,6 +483,26 @@ mod tests {
             return None;
         }
         Some(cand.to_string())
+    }
+
+    #[test]
+    fn meta_prints_unscoped_only() {
+        let data = serde_json::json!({
+            "control_port": 6379, "hostname": "y",
+            "groups": { "g": { "gpus_total": 1.0, "gpus_used": 0.0,
+                "agents": { "g@c@10.0.0.1": {
+                    "node_ip": "10.0.0.1", "container": "c", "alive": true,
+                    "machine": {"memory": 0, "cpus": 1, "gpus": []}, "gpus_free": [],
+                    "meta": {"driver.nvidia": "580.95.05", "note": "1/1 GPU spare"}}},
+                "placement_groups": {}, "actors": {} } }
+        });
+        let text = render(&data, false);
+        assert!(
+            text.contains("    meta driver.nvidia=580.95.05 note=\"1/1 GPU spare\"\n"),
+            "{text}"
+        );
+        assert!(!render(&data, true).contains("meta "));
+        assert_eq!(entrypoint_gpu_gate(&render(&data, true)), Some(1));
     }
 
     #[test]

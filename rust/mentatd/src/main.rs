@@ -16,6 +16,7 @@ mod http;
 mod island;
 mod machine;
 mod mesh;
+mod meta;
 mod proto;
 mod state;
 mod status;

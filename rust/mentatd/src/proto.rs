@@ -278,6 +278,11 @@ pub enum Msg {
         /// until those results arrive.
         #[serde(default)]
         unacked_refs: Vec<String>,
+        /// Diagnostic key/value strings: the kernel, driver versions, RoCE
+        /// GIDs, and whatever the container adds. The daemon stores the map
+        /// on the agent row, and nothing else reads it.
+        #[serde(default)]
+        meta: BTreeMap<String, String>,
     },
     /// The reply to `agent_register`.
     AgentRegisterOk { proto: String, node_id: String },

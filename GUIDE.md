@@ -196,6 +196,7 @@ omits that line.
 Print the `/status` document. The default output is the text form.
 
 The text form has one line per daemon, peer, fabric island, group and agent.
+Unscoped, each agent's metadata follows on a `meta key=value ...` line.
 Under each peer, `reach from <local>: <remote>=ok/<rtt>ms ...` gives the
 probe result for each address pair. `fabric N: <addr> ...` lists each
 island's members by fabric address.
@@ -241,8 +242,9 @@ connection to the daemon, held open for as long as the endpoint is to be
 served, and redialled when the daemon restarts. It reads the same
 environment as `mentatd start` (`MENTAT_GROUP`, `MENTAT_OPENAI_API`,
 `MENTAT_MCP_API`, `MENTAT_MODEL_PROVIDER`, `CONTAINER_NAME`,
-`MENTAT_NODE_IP`, and the daemon address). Each variable has a flag of the
-same name. It runs beside the engine:
+`MENTAT_NODE_IP`, `MENTAT_META_FILE`, `MENTAT_META_<NAME>`, and the daemon
+address). Each variable except `MENTAT_META_<NAME>` has a flag of the same
+name. The module runs beside the engine:
 
 ```
 python -m ray.register &
@@ -670,6 +672,18 @@ The MCP endpoint this container announces. It belongs on every rank.
 The engine behind `MENTAT_OPENAI_API`, for example `vllm`. Lowercased and
 announced with the endpoint. It belongs on the same rank.
 
+- `MENTAT_META_<NAME>` (default: unset)
+
+Sets the metadata key `<name>`, lowercased, to the value. See "Agent
+metadata".
+
+- `MENTAT_META_FILE` (default: unset)
+
+A JSON object of metadata keys and values. A string value is used as it
+is, and any other value as its JSON text. `MENTAT_META_<NAME>` overrides an
+entry. A file that cannot be read or parsed logs `agent_meta_file_bad`, and
+the agent starts without it.
+
 - `MENTAT_CLAIM` (default: unset)
 
 Claim this name before placing, and place inside the claim. See "Claims".
@@ -786,6 +800,38 @@ Log lines are `key=value` pairs. Notable keys:
   `peer_forgotten` when the mesh learns, settles, follows and drops a peer.
 - `history_swept` with the counts of actors, placement groups, agents and
   refs dropped.
+- `agent_meta_dropped` with the metadata keys outside the limits.
+
+### Agent metadata
+
+Each agent registers a map of strings for diagnostics. The daemon shows it
+as `meta` on the agent row in `/status`, and the unscoped text form of
+`mentatd status` prints it under the agent's line. The scoped form leaves it
+out, since entrypoints grep that output. Placement and routing ignore it.
+
+`mentatd start` reads these off the box:
+
+| Key | Source |
+| --- | --- |
+| `kernel` | `/proc/sys/kernel/osrelease` |
+| `driver.nvidia`, `driver.amdgpu`, `driver.mlx5_core` | `/sys/module/<module>/version`, for each module that has one |
+| `rdma.<dev>.<port>.state` | The port's `state`, such as `ACTIVE` |
+| `rdma.<dev>.<port>.gid` | Each RoCE v2 GID that maps an IPv4 address, as `<index> <address> <netdev>`. The index is the value for `NCCL_IB_GID_INDEX` |
+
+`MENTAT_META_FILE`, then `MENTAT_META_<NAME>`, add keys and override these.
+A container knows nothing of its image, so the image reference and layers
+come from outside: the compose file sets a variable, or the image build
+writes the file.
+
+```yaml
+environment:
+  MENTAT_META_IMAGE: vllm/vllm-openai:v0.11.0
+  MENTAT_META_FILE: /etc/mentat-meta.json   # written at image build
+```
+
+A key matches `[a-z0-9._-]{1,64}` and a value is at most 1024 bytes. The
+first 64 valid keys, in key order, are kept. `python -m ray.register` reads
+the variables and the file, and reads nothing off the box.
 
 ## Limits
 

@@ -114,6 +114,8 @@ pub struct AgentInfo {
     /// `host` against this node's addresses. The daemon does not: only the
     /// router knows which links it shares with this node.
     pub services: std::collections::BTreeMap<String, crate::proto::Service>,
+    /// Diagnostic strings from the registration. See `crate::meta`.
+    pub meta: std::collections::BTreeMap<String, String>,
     pub writer: FrameWriter,
     pub alive: bool,
     /// When the agent link EOFed (degrade window start). None while

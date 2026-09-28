@@ -25,6 +25,7 @@ retries, which is what lets the engine and the daemon start in any order.
 """
 
 import argparse
+import json
 import os
 import socket
 import sys
@@ -93,6 +94,33 @@ def services(args):
     return out
 
 
+def meta(args, environ=None):
+    """The registration's `meta` map, from the Rust agent's sources less
+    the box probes.
+
+    `MENTAT_META_FILE` is a JSON object. A string value is used as it is,
+    and any other value as its JSON text. `MENTAT_META_<NAME>` then sets the
+    key `<name>` in lowercase. An unreadable file is logged and skipped.
+    """
+    environ = os.environ if environ is None else environ
+    out = {}
+    if args.meta_file:
+        try:
+            with open(args.meta_file) as f:
+                obj = json.load(f)
+            if not isinstance(obj, dict):
+                raise ValueError("not a JSON object")
+            for k, v in obj.items():
+                out[k] = v if isinstance(v, str) else json.dumps(v)
+        except (OSError, ValueError) as e:
+            log("agent_meta_file_bad", path=args.meta_file, error=repr(str(e)))
+    for k, v in environ.items():
+        name = k[len("MENTAT_META_"):] if k.startswith("MENTAT_META_") else ""
+        if name and name != "FILE":
+            out[name.lower()] = v
+    return out
+
+
 def agent_id(args):
     """The Rust agent's id, to the character: two ranks of one group run
     containers named the same thing, and identical ids make their
@@ -152,6 +180,7 @@ def register_frame(args):
         "services": services(args),
         "resume": [],
         "unacked_refs": [],
+        "meta": meta(args),
     }
 
 
@@ -245,6 +274,8 @@ def parse_args(argv):
                    help="what serves the OpenAI endpoint (MENTAT_MODEL_PROVIDER)")
     p.add_argument("--container", default=env("CONTAINER_NAME") or socket.gethostname(),
                    help="container name (CONTAINER_NAME)")
+    p.add_argument("--meta-file", default=env("MENTAT_META_FILE", ""),
+                   help="a JSON object of diagnostic strings (MENTAT_META_FILE)")
     p.add_argument("--node-ip", default=env("MENTAT_NODE_IP", ""),
                    help="this node's address, or empty to let the daemon "
                         "decide (MENTAT_NODE_IP)")

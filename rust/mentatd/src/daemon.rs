@@ -2356,6 +2356,7 @@ fn agent_conn(
         services,
         resume,
         unacked_refs,
+        meta,
     } = first.0.msg
     else {
         unreachable!()
@@ -2373,6 +2374,15 @@ fn agent_conn(
             &[],
         );
         return;
+    }
+
+    // An agent of another build applies its own limits, or none.
+    let (meta, dropped) = crate::meta::bounded(meta);
+    if !dropped.is_empty() {
+        log(
+            "agent_meta_dropped",
+            &[("agent", agent_id.clone()), ("keys", dropped.join(","))],
+        );
     }
 
     let (node_ip, node_id) = {
@@ -2445,6 +2455,7 @@ fn agent_conn(
                 container: container.clone(),
                 pid,
                 services: services.clone(),
+                meta,
                 writer: writer.clone(),
                 alive: true,
                 lost_at_ms: None,
@@ -3029,6 +3040,7 @@ mod tests {
                 container: "c".into(),
                 pid: 1,
                 services: Default::default(),
+                meta: Default::default(),
                 writer: crate::state::FrameWriter::new(stream),
                 alive: true,
                 lost_at_ms: None,

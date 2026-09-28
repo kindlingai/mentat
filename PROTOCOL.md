@@ -296,7 +296,7 @@ Placing outside the claim would split ranks that agreed on one view.
 
 | Direction | Message | Fields |
 | --- | --- | --- |
-| Agent to daemon | `agent_register` | `proto`, `agent_id`, `group`, `node_ip`, `container`, `pid`, `machine`, `services?`, `resume?`, `unacked_refs?` |
+| Agent to daemon | `agent_register` | `proto`, `agent_id`, `group`, `node_ip`, `container`, `pid`, `machine`, `services?`, `resume?`, `unacked_refs?`, `meta?` |
 | Daemon to agent | `agent_register_ok` | `proto`, `node_id` |
 | Daemon to agent | `actor_spawn` | `actor_id`, `name`, `env`, `gpu_ids`, `owner`. Payload: pickled `(cls, args, kwargs)`. The daemon adds the actor's own variables to `env`, which GUIDE.md lists under "Actor process" |
 | Agent to daemon | `actor_spawn_result` | `actor_id`, `ok`, `error?`, `pid?` (0 when the failure came before the fork) |
@@ -319,7 +319,10 @@ Placing outside the claim would split ranks that agreed on one view.
               "note": ""}},
  "resume": [{"actor_id": "a1", "name": "w0", "gpu_ids": [0], "pid": 9312,
              "owner": "c1", "pending_refs": ["a1:7"]}],
- "unacked_refs": ["a1:8"]}
+ "unacked_refs": ["a1:8"],
+ "meta": {"kernel": "6.11.0-1016-nvidia", "driver.nvidia": "580.95.05",
+          "rdma.mlx5_0.1.gid": "3 10.100.0.1 enp1s0f0np0",
+          "image": "vllm/vllm-openai:v0.11.0"}}
 ```
 
 | Field | Value |
@@ -327,6 +330,7 @@ Placing outside the claim would split ranks that agreed on one view.
 | `actor_result.error?` | Set, with an empty payload, when mentat itself failed. Only a Python failure has an exception to pickle |
 | `resume` | Actors alive across a reconnect, each with its `owner?`, so a daemon that lost its state rebuilds ownership |
 | `unacked_refs` | Ref ids whose results are buffered agent-side and follow the register. The daemon holds them pending until they arrive |
+| `meta` | String keys to string values, for diagnostics. A key matches `[a-z0-9._-]{1,64}` and a value is at most 1024 bytes. The daemon keeps the first 64 valid entries in key order, drops the rest and logs `agent_meta_dropped`. Nothing reads the values |
 
 | Field | Value |
 | --- | --- |
@@ -601,7 +605,7 @@ one row by path.
 
 | Field | Value |
 | --- | --- |
-| `machine`, `services` | The agent's registration verbatim |
+| `machine`, `services`, `meta` | The agent's registration. `meta` is `{}` when the agent sent none |
 | `gpus_free` | Device indices held by neither a live placement group nor a live actor |
 | `gpus_total`, `gpus_used` | Devices across the group's alive agents |
 | actor `state` | `spawning`, `running` or `dead`, with `reason` filled for `dead` |

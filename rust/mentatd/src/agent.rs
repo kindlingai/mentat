@@ -55,6 +55,8 @@ struct AgentShared {
     /// Findings about announced services, held on every register so a
     /// reconnect does not lose them.
     service_notes: Mutex<BTreeMap<String, String>>,
+    /// Read once at start. Every register sends it.
+    meta: crate::meta::Meta,
     /// Daemon-bound messages (results, exits) that could not be delivered
     /// while the daemon link was down. Drained in order right after the next
     /// successful register so nothing from an outage is silently lost.
@@ -106,6 +108,7 @@ pub fn run(opts: AgentOpts) -> ! {
         actors: Mutex::new(HashMap::new()),
         sock_dir,
         service_notes: Mutex::new(BTreeMap::new()),
+        meta: crate::meta::collect(),
         unsent: Mutex::new(Vec::new()),
     });
     watch_service_binds(&shared, &services);
@@ -558,6 +561,7 @@ fn serve_once(
             services: with_notes(services, &shared.service_notes.lock().unwrap()),
             resume,
             unacked_refs,
+            meta: shared.meta.clone(),
         },
         1,
         &[],
