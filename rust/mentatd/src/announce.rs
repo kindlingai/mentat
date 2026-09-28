@@ -512,6 +512,20 @@ pub fn local_addr_ifaces() -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The MAC of each address's interface, for the addresses
+/// `local_addr_ifaces` places. A prober compares it with the MAC that
+/// answered ARP for the address. Empty where sysfs is missing.
+pub fn local_addr_macs() -> BTreeMap<String, String> {
+    local_addr_ifaces()
+        .into_iter()
+        .filter_map(|(addr, iface)| {
+            let mac = std::fs::read_to_string(format!("/sys/class/net/{iface}/address")).ok()?;
+            let mac = mac.trim().to_ascii_lowercase();
+            (!mac.is_empty()).then_some((addr, mac))
+        })
+        .collect()
+}
+
 /// Tags per address, for the addresses that were given any. Empty unless
 /// MENTAT_ANNOUNCE_IFACES names tags, so every tag a datagram holds is
 /// one an operator set.

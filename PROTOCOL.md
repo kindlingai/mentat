@@ -385,7 +385,7 @@ as protocol input:
 | Key | Read for |
 | --- | --- |
 | `head_node_id` | Election |
-| `addrs`, `addr_tags`, `addr_ifaces` | Refreshing the sending peer's own row |
+| `addrs`, `addr_tags`, `addr_ifaces`, `addr_macs` | Refreshing the sending peer's own row |
 | `peers/<node_id>/alive`, `node_ip`, `control_port` | Dialing a peer's peers, so one seed address reaches the whole mesh |
 | `peers/<node_id>/addrs`, `addr_tags` | Island membership, which decides where an `rdma` claim fits |
 | `peers/<node_id>/probes/<local>/<remote>/ok`, `rtt_ms` | The link topology a claim is solved against, and island membership |
@@ -409,6 +409,15 @@ requires the expected `node_id` in the reply. Both fabrics in a multi-pair
 cluster may share a subnet, so a reply from an address does not prove the
 intended node sent it. Binding the local address makes the result describe
 the cabling. An unbound probe reports the routing table's preference.
+
+A probe from an `rdma`-tagged address is also bound to that address's
+interface (`SO_BINDTODEVICE`), so it leaves on that port's cable. A kernel
+that refuses the bind logs `probe_iface_bind_refused` once per interface,
+and the probe keeps the address bind alone. After such a probe answers, the
+prober reads the ARP entry for the remote address on that interface into
+`neighbour_mac`. `direct` is true when that MAC is the peer's `addr_macs`
+entry for the address. `direct` is false when another box answered ARP for
+the address and forwards to it, and null when either MAC is unknown.
 
 Each daemon probes every address pair (own address, peer address) once per
 `MENTAT_PROBE_INTERVAL_MS`. A probe times out at `MENTAT_PROBE_TIMEOUT_MS`.
@@ -504,6 +513,7 @@ joins by being on the same broadcast domain.
 | `addrs` | Every address the node listens on, most preferred first. Only the node can rank its own links |
 | `addr_tags` | Each address to its operator tags |
 | `addr_ifaces` | Each address to the interface it sits on. Addresses from `MENTAT_ANNOUNCE_ADDRS` are absent |
+| `addr_macs` | Each address in `addr_ifaces` to its interface's MAC, in lowercase. Absent where the node cannot read it. Status pushes carry it, and `peer_hello` does not |
 
 `rdma` is the one interpreted tag. It means the operator cabled this address
 into a fabric. Placement acts on it once a probe over it has succeeded. A
@@ -570,14 +580,17 @@ the same object. `?group=` on `/status` and `group` on `status` scope it.
 {"proto": "0.99", "node_id": "...", "node_ip": "10.0.0.1", "hostname": "n1",
  "control_port": 6379, "head_node_id": "...", "head_generation": 3,
  "seq": 41, "boot_id": "6d6474919bbe7beb",
- "addrs": [...], "addr_tags": {...}, "addr_ifaces": {...},
+ "addrs": [...], "addr_tags": {...}, "addr_ifaces": {...}, "addr_macs": {...},
  "islands": [{"nodes": ["..."], "addrs": {"<node_id>": "10.0.0.1"}}],
  "peers": {"<node_id>": {
    "node_ip": "...", "link_ip": "...", "addrs": [...], "addr_tags": {...},
-   "addr_ifaces": {...}, "control_port": 6379, "http_port": 6380,
-   "alive": true, "stale": false, "last_seen_ms": 0, "dead_since_ms": null,
+   "addr_ifaces": {...}, "addr_macs": {...}, "control_port": 6379,
+   "http_port": 6380, "alive": true, "stale": false, "last_seen_ms": 0,
+   "dead_since_ms": null,
    "probes": {"<local>": {"<remote>": {"ok": true, "rtt_ms": 0,
-                                       "last_ok_ms": null, "error": ""}}},
+                                       "last_ok_ms": null, "error": "",
+                                       "neighbour_mac": "aa:bb:cc:dd:ee:02",
+                                       "direct": true}}},
    "groups": {"<group>": {"gpus_total": 2, "gpus_used": 1}}}},
  "clients": {"<client_id>": {"group": "glm", "kind": "driver",
                              "node_id": "...", "session": true}},

@@ -389,7 +389,8 @@ link into a fabric. Probing checks it.
 Every `MENTAT_PROBE_INTERVAL_MS`, each daemon opens one TCP connection per
 address pair (own address, peer address), with the source address bound.
 Binding the source makes the result describe the cabling. An unbound probe
-describes the routing table. Peers are probed concurrently. A pair that
+describes the routing table. A probe from an `rdma`-tagged address is also
+bound to that address's interface, so it leaves on that port's cable. Peers are probed concurrently. A pair that
 fails logs `fabric_addr_unverified` once and stays out of placement. Rows
 for an address the daemon has lost, or one missing from the peer's current
 list, are dropped after the round.
@@ -404,6 +405,18 @@ mentatd status          # `reach from <addr>: <addr>=ok/0ms ...` per peer
 A pair that was cabled and reads `fail` is a cable fault or a tag on the
 wrong interface. A pair that reads `ok` on a link nothing was cabled on is a
 tag on the wrong interface.
+
+After a bound probe answers, the daemon reads the ARP entry for the peer's
+address on that interface. Each daemon publishes the MAC of each of its
+addresses, so a reader can tell who is at the other end of the cable. A pair
+whose ARP entry is another box's MAC reads `fwd(<that box>)`. That box
+answers ARP for the peer and forwards the traffic, as a hairpin does.
+
+A box with two fabric ports in one subnet answers ARP for either address on
+either port by default. A probe then reaches the peer's other port over the
+wrong cable, and `probe_port_ambiguous` logs the local address. Set
+`net.ipv4.conf.all.arp_ignore=1` and `arp_announce=2`, or give each cable its
+own subnet.
 
 ### Islands
 
@@ -801,6 +814,10 @@ Log lines are `key=value` pairs. Notable keys:
 - `history_swept` with the counts of actors, placement groups, agents and
   refs dropped.
 - `agent_meta_dropped` with the metadata keys outside the limits.
+- `probe_port_ambiguous` when a fabric address reaches a peer on two of its
+  interfaces. See "Probing".
+- `probe_iface_bind_refused` when the kernel refuses to bind a probe to its
+  interface. The probe keeps its address bind.
 
 ### Agent metadata
 

@@ -6,6 +6,7 @@
 //! the same answer to one question: which daemon is the head. Every group
 //! lives there, relayed by the daemon a container reached.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufReader;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
@@ -512,10 +513,17 @@ fn register_peer(shared: &SharedRef, p: PeerIdent, writer: FrameWriter) -> bool 
     // describe cabling, which a dropped control link proves nothing about,
     // and discarding them would leave placement blind until the next probe
     // round.
-    let (probe_pairs, last_status, was_alive) = st
+    let (probe_pairs, addr_macs, last_status, was_alive) = st
         .peers
         .get(&node_id)
-        .map(|p| (p.probe_pairs.clone(), p.last_status.clone(), p.alive))
+        .map(|p| {
+            (
+                p.probe_pairs.clone(),
+                p.addr_macs.clone(),
+                p.last_status.clone(),
+                p.alive,
+            )
+        })
         .unwrap_or_default();
     st.peers.insert(
         node_id.clone(),
@@ -528,6 +536,8 @@ fn register_peer(shared: &SharedRef, p: PeerIdent, writer: FrameWriter) -> bool 
             addr_tags,
             addr_ifaces,
             probe_pairs,
+            addr_macs,
+            ambiguous_ports: Default::default(),
             control_port,
             http_port,
             writer,
@@ -593,6 +603,12 @@ fn peer_loop(
                     }
                     if let Some(t) = data["addr_ifaces"].as_object() {
                         p.addr_ifaces = t
+                            .iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect();
+                    }
+                    if let Some(t) = data["addr_macs"].as_object() {
+                        p.addr_macs = t
                             .iter()
                             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                             .collect();
@@ -883,6 +899,10 @@ fn prober(shared: SharedRef) {
         std::thread::sleep(interval);
         let my_id = shared.st.lock().unwrap().node_id.clone();
         let locals = crate::announce::local_addrs();
+        let bind_ifaces = fabric_ifaces(
+            crate::announce::local_addr_ifaces(),
+            &crate::announce::local_addr_tags(),
+        );
         // Peers worth probing: alive, probe-replying, and with a control
         // port to aim at. Collected before any connecting so the state lock
         // is never held across a network wait.
@@ -900,8 +920,15 @@ fn prober(shared: SharedRef) {
                 let shared = shared.clone();
                 let my_id = my_id.clone();
                 let locals = locals.clone();
+                let bind_ifaces = bind_ifaces.clone();
                 std::thread::spawn(move || {
-                    probe_peer(&shared, &my_id, &peer_id, port, &locals, &remotes, timeout)
+                    let me = Prober {
+                        my_id: &my_id,
+                        locals: &locals,
+                        bind_ifaces: &bind_ifaces,
+                        timeout,
+                    };
+                    probe_peer(&shared, &me, &peer_id, port, &remotes)
                 })
             })
             .collect();
@@ -911,19 +938,49 @@ fn prober(shared: SharedRef) {
     }
 }
 
-/// One round against one peer: every (local, remote) pair, then the prune.
-fn probe_peer(
-    shared: &SharedRef,
-    my_id: &str,
-    peer_id: &str,
-    port: u16,
-    locals: &[String],
-    remotes: &[String],
+/// Settings shared by every probe in one round.
+struct Prober<'a> {
+    my_id: &'a str,
+    locals: &'a [String],
+    /// Each `rdma`-tagged local address, mapped to the interface its
+    /// probes leave on.
+    bind_ifaces: &'a BTreeMap<String, String>,
     timeout: Duration,
-) {
-    for local in locals {
+}
+
+/// The interface of each `rdma`-tagged local address.
+///
+/// A fabric probe leaves on the port under test. Pinning the source
+/// address alone lets the routing table pick the egress interface, and on
+/// a box with two fabric ports in one subnet that is often the other
+/// cable. Other addresses keep routing, since a LAN peer may sit behind
+/// another interface.
+fn fabric_ifaces(
+    ifaces: BTreeMap<String, String>,
+    tags: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, String> {
+    ifaces
+        .into_iter()
+        .filter(|(addr, _)| {
+            tags.get(addr)
+                .is_some_and(|t| t.iter().any(|t| t == "rdma"))
+        })
+        .collect()
+}
+
+/// One round against one peer: every (local, remote) pair, then the prune.
+fn probe_peer(shared: &SharedRef, me: &Prober, peer_id: &str, port: u16, remotes: &[String]) {
+    for local in me.locals {
         for remote in remotes {
-            let r = probe_pair(my_id, peer_id, local, remote, port, timeout);
+            let iface = me.bind_ifaces.get(local).map(String::as_str);
+            let r = probe_pair(me, peer_id, local, iface, remote, port);
+            // A bound probe that answered resolved the remote address on its
+            // interface. The MAC that answered ARP is whoever is at the other
+            // end of this cable.
+            let mac = match (&r, iface) {
+                (Ok(_), Some(dev)) => neighbour_mac(remote, dev),
+                _ => None,
+            };
             let now = now_ms_u64();
             let mut st = shared.st.lock().unwrap();
             let Some(p) = st.peers.get_mut(peer_id) else {
@@ -939,8 +996,16 @@ fn probe_peer(
                     rtt_ms: 0,
                     last_ok_ms: None,
                     error: String::new(),
+                    neighbour_mac: None,
+                    direct: None,
                 });
-            let was = cell.ok;
+            let was = (cell.ok, cell.direct);
+            cell.neighbour_mac = mac;
+            cell.direct = cell
+                .neighbour_mac
+                .as_ref()
+                .zip(p.addr_macs.get(remote))
+                .map(|(seen, own)| seen == own);
             match r {
                 Ok(rtt) => {
                     cell.ok = true;
@@ -956,7 +1021,7 @@ fn probe_peer(
             // One line per transition. The table is read from /status, and
             // a 15 s interval times four pairs would otherwise be the whole
             // log.
-            if was != cell.ok {
+            if was != (cell.ok, cell.direct) {
                 log(
                     "probe_pair",
                     &[
@@ -964,7 +1029,15 @@ fn probe_peer(
                         ("local", local.clone()),
                         ("remote", remote.clone()),
                         ("ok", cell.ok.to_string()),
+                        (
+                            "direct",
+                            cell.direct.map(|d| d.to_string()).unwrap_or_default(),
+                        ),
                         ("rtt_ms", cell.rtt_ms.to_string()),
+                        (
+                            "neighbour_mac",
+                            cell.neighbour_mac.clone().unwrap_or_default(),
+                        ),
                         ("error", cell.error.clone()),
                     ],
                 );
@@ -973,8 +1046,57 @@ fn probe_peer(
     }
     let mut st = shared.st.lock().unwrap();
     if let Some(p) = st.peers.get_mut(peer_id) {
-        prune_pairs(&mut p.probe_pairs, locals, remotes);
+        prune_pairs(&mut p.probe_pairs, me.locals, remotes);
+        let now = ambiguous_ports(&p.probe_pairs, me.bind_ifaces, &p.addr_ifaces);
+        for (local, reached) in &now {
+            if !p.ambiguous_ports.contains(local) {
+                log(
+                    "probe_port_ambiguous",
+                    &[
+                        ("peer", peer_id.to_string()),
+                        ("local", local.clone()),
+                        ("reached", reached.join(",")),
+                        (
+                            "why",
+                            "one cable ends at one port; the far box answers ARP for \
+                             addresses on its other ports (see arp_ignore)"
+                                .to_string(),
+                        ),
+                    ],
+                );
+            }
+        }
+        p.ambiguous_ports = now.into_keys().collect();
     }
+}
+
+/// Fabric addresses whose probes reached the peer on two or more of its
+/// interfaces, with the remote addresses they reached. A peer address with
+/// no known interface counts as an interface of its own.
+fn ambiguous_ports(
+    table: &crate::state::ProbeTable,
+    bind_ifaces: &BTreeMap<String, String>,
+    peer_ifaces: &BTreeMap<String, String>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for (local, row) in table {
+        if !bind_ifaces.contains_key(local) {
+            continue;
+        }
+        let reached: Vec<String> = row
+            .iter()
+            .filter(|(_, c)| c.ok)
+            .map(|(r, _)| r.clone())
+            .collect();
+        let ifaces: BTreeSet<&str> = reached
+            .iter()
+            .map(|r| peer_ifaces.get(r).map(String::as_str).unwrap_or(r))
+            .collect();
+        if ifaces.len() > 1 {
+            out.insert(local.clone(), reached);
+        }
+    }
+    out
 }
 
 /// Drop rows for addresses outside `locals` and `remotes`.
@@ -985,16 +1107,18 @@ fn prune_pairs(table: &mut crate::state::ProbeTable, locals: &[String], remotes:
     }
 }
 
-/// One probe: connect from `local` to `remote:port`, exchange the frames,
-/// close. Returns the round trip on success.
+/// One probe: connect from `local`, on `iface` when given, to
+/// `remote:port`, exchange the frames, close. Returns the round trip on
+/// success.
 fn probe_pair(
-    my_id: &str,
+    me: &Prober,
     peer_id: &str,
     local: &str,
+    iface: Option<&str>,
     remote: &str,
     port: u16,
-    timeout: Duration,
 ) -> std::io::Result<Duration> {
+    let (my_id, timeout) = (me.my_id, me.timeout);
     let started = Instant::now();
     let stream = match crate::testnet::load() {
         Some(net) => {
@@ -1012,7 +1136,7 @@ fn probe_pair(
             })?;
             TcpStream::connect_timeout(&addr, timeout)?
         }
-        None => connect_from(local, remote, port, timeout)?,
+        None => connect_from(local, iface, remote, port, timeout)?,
     };
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
@@ -1048,17 +1172,24 @@ fn probe_pair(
     }
 }
 
-/// TCP connect with the source address pinned, and with a deadline.
+/// TCP connect with the source address pinned, the egress interface pinned
+/// when `iface` is given, and a deadline.
 ///
-/// Neither half comes free from std: TcpStream::connect picks the source
+/// None of that comes free from std: TcpStream::connect picks the source
 /// address by routing table, and connect_timeout cannot bind one. So the
 /// socket is built by hand -- bind, then a non-blocking connect polled to the
 /// deadline, because a dropped SYN would otherwise hold this thread for the
 /// kernel's retry schedule, minutes past the probe interval.
 ///
+/// A kernel that refuses the interface bind (before Linux 5.7 it needs
+/// CAP_NET_RAW) gets the address bind alone, and the refusal is logged once
+/// per interface. Failing the probe instead would drop every island on
+/// upgrade.
+///
 /// IPv4 only, matching what announce selects.
 fn connect_from(
     local: &str,
+    iface: Option<&str>,
     remote: &str,
     port: u16,
     timeout: Duration,
@@ -1081,6 +1212,9 @@ fn connect_from(
         }
         // Owned from here on, so every early return closes it.
         let sock = TcpStream::from_raw_fd(fd);
+        if let Some(name) = iface {
+            bind_iface(fd, name);
+        }
 
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
         addr.sin_family = libc::AF_INET as libc::sa_family_t;
@@ -1146,9 +1280,181 @@ fn connect_from(
     }
 }
 
+/// The MAC `/proc/net/arp` holds for `ip` on `dev`, or None without a
+/// complete entry.
+fn neighbour_mac(ip: &str, dev: &str) -> Option<String> {
+    arp_entry(&std::fs::read_to_string("/proc/net/arp").ok()?, ip, dev)
+}
+
+/// One `/proc/net/arp` row's MAC. The columns are address, hardware type,
+/// flags, MAC, mask and device. Flags 0x0 is an incomplete entry.
+fn arp_entry(table: &str, ip: &str, dev: &str) -> Option<String> {
+    table.lines().skip(1).find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        (f.len() >= 6 && f[0] == ip && f[5] == dev && f[2] != "0x0")
+            .then(|| f[3].to_ascii_lowercase())
+    })
+}
+
+/// Pin `fd`'s egress to the interface `name`. A refusal is logged once per
+/// interface and the socket keeps its address bind.
+#[cfg(target_os = "linux")]
+fn bind_iface(fd: std::os::fd::RawFd, name: &str) {
+    static REFUSED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    // SAFETY: fd is an open socket. The kernel reads at most `len` bytes of
+    // the name.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            name.as_ptr() as *const libc::c_void,
+            name.len() as libc::socklen_t,
+        )
+    };
+    if rc < 0 && REFUSED.lock().unwrap().insert(name.to_string()) {
+        log(
+            "probe_iface_bind_refused",
+            &[
+                ("iface", name.to_string()),
+                ("error", std::io::Error::last_os_error().to_string()),
+            ],
+        );
+    }
+}
+
+/// Other systems probe with the address bind alone.
+#[cfg(not(target_os = "linux"))]
+fn bind_iface(_fd: std::os::fd::RawFd, _name: &str) {}
+
 #[cfg(test)]
 mod tests {
-    use super::same_box;
+    use super::{ambiguous_ports, arp_entry, fabric_ifaces, same_box};
+    use crate::state::{PairProbe, ProbeTable};
+    use std::collections::BTreeMap;
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    fn table(rows: &[(&str, &str, bool)]) -> ProbeTable {
+        let mut t = ProbeTable::new();
+        for (local, remote, ok) in rows {
+            t.entry(local.to_string()).or_default().insert(
+                remote.to_string(),
+                PairProbe {
+                    ok: *ok,
+                    rtt_ms: 0,
+                    last_ok_ms: None,
+                    error: String::new(),
+                    neighbour_mac: None,
+                    direct: None,
+                },
+            );
+        }
+        t
+    }
+
+    #[test]
+    fn the_arp_table_gives_a_complete_entry_on_its_device() {
+        let t = "IP address       HW type     Flags       HW address            Mask     Device\n\
+                 10.0.0.2         0x1         0x2         AA:bb:cc:00:00:02     *        p1\n\
+                 10.0.0.2         0x1         0x2         aa:bb:cc:00:00:99     *        p2\n\
+                 10.0.0.3         0x1         0x0         00:00:00:00:00:00     *        p1\n";
+        assert_eq!(
+            arp_entry(t, "10.0.0.2", "p1").as_deref(),
+            Some("aa:bb:cc:00:00:02")
+        );
+        assert_eq!(
+            arp_entry(t, "10.0.0.2", "p2").as_deref(),
+            Some("aa:bb:cc:00:00:99")
+        );
+        assert_eq!(arp_entry(t, "10.0.0.3", "p1"), None);
+        assert_eq!(arp_entry(t, "10.0.0.4", "p1"), None);
+    }
+
+    #[test]
+    fn only_rdma_tagged_addresses_bind_an_interface() {
+        let ifaces = map(&[("10.0.0.1", "enp1s0f0np0"), ("192.168.1.70", "eno1")]);
+        let tags = BTreeMap::from([
+            (
+                "10.0.0.1".to_string(),
+                vec!["connectx".to_string(), "rdma".to_string()],
+            ),
+            ("192.168.1.70".to_string(), vec!["lan".to_string()]),
+        ]);
+        assert_eq!(
+            fabric_ifaces(ifaces, &tags),
+            map(&[("10.0.0.1", "enp1s0f0np0")])
+        );
+    }
+
+    /// A reaches B's port-1 address over the cable, and B also answers for
+    /// its port-2 address on that same cable.
+    #[test]
+    fn a_port_reaching_two_peer_interfaces_is_ambiguous() {
+        let bind = map(&[("10.0.0.1", "p1"), ("10.0.0.3", "p2")]);
+        let peer = map(&[("10.0.0.2", "q1"), ("10.0.0.4", "q2")]);
+        let t = table(&[
+            ("10.0.0.1", "10.0.0.2", true),
+            ("10.0.0.1", "10.0.0.4", true),
+            ("10.0.0.3", "10.0.0.2", false),
+            ("10.0.0.3", "10.0.0.4", true),
+        ]);
+        let got = ambiguous_ports(&t, &bind, &peer);
+        assert_eq!(
+            got,
+            BTreeMap::from([(
+                "10.0.0.1".to_string(),
+                vec!["10.0.0.2".to_string(), "10.0.0.4".to_string()]
+            )])
+        );
+    }
+
+    /// Two addresses on one peer interface, a LAN address that reaches
+    /// everything, and failed pairs are all ordinary.
+    #[test]
+    fn one_peer_interface_or_an_unbound_local_is_not_ambiguous() {
+        let bind = map(&[("10.0.0.1", "p1")]);
+        let peer = map(&[("10.0.0.2", "q1"), ("10.0.0.5", "q1"), ("10.0.0.4", "q2")]);
+        let t = table(&[
+            ("10.0.0.1", "10.0.0.2", true),
+            ("10.0.0.1", "10.0.0.5", true),
+            ("10.0.0.1", "10.0.0.4", false),
+            ("192.168.1.70", "10.0.0.2", true),
+            ("192.168.1.70", "10.0.0.4", true),
+        ]);
+        assert!(ambiguous_ports(&t, &bind, &peer).is_empty());
+    }
+
+    /// A peer address with no known interface counts as its own.
+    #[test]
+    fn an_unknown_peer_interface_counts_as_another() {
+        let bind = map(&[("10.0.0.1", "p1")]);
+        let peer = map(&[("10.0.0.2", "q1")]);
+        let t = table(&[
+            ("10.0.0.1", "10.0.0.2", true),
+            ("10.0.0.1", "10.0.0.9", true),
+        ]);
+        assert_eq!(ambiguous_ports(&t, &bind, &peer).len(), 1);
+    }
+
+    /// The probe connects through a bound interface, and through the
+    /// address bind alone when the kernel refuses the interface.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_probe_connects_bound_to_its_interface() {
+        use super::connect_from;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let t = Duration::from_secs(2);
+        connect_from("127.0.0.1", Some("lo"), "127.0.0.1", port, t).unwrap();
+        connect_from("127.0.0.1", Some("no-such-if0"), "127.0.0.1", port, t).unwrap();
+    }
 
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()

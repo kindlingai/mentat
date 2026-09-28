@@ -273,6 +273,14 @@ pub struct PairProbe {
     pub last_ok_ms: Option<u64>,
     /// Why the last attempt failed. Empty while ok.
     pub error: String,
+    /// For a fabric pair that answered: the MAC in the ARP entry for the
+    /// remote address on the local interface. That MAC belongs to the box
+    /// at the other end of the cable.
+    pub neighbour_mac: Option<String>,
+    /// True when `neighbour_mac` is the peer's own MAC for the remote
+    /// address. False when another box answered for it and forwards the
+    /// traffic. None when either MAC is unknown.
+    pub direct: Option<bool>,
 }
 
 /// Probed pairs, keyed local address then remote address. An address pair
@@ -299,8 +307,14 @@ pub struct PeerInfo {
     pub addr_tags: std::collections::BTreeMap<String, Vec<String>>,
     /// The interface each address sits on, where the peer knew one.
     pub addr_ifaces: std::collections::BTreeMap<String, String>,
+    /// The MAC of each address's interface, from the peer's status pushes.
+    pub addr_macs: std::collections::BTreeMap<String, String>,
     /// What probing this peer has found, keyed local then remote address.
     pub probe_pairs: ProbeTable,
+    /// Local fabric addresses whose probes reached this peer on two or more
+    /// of its interfaces. One cable ends at one interface, so the far box
+    /// answered for an address on another port. Logged once per change.
+    pub ambiguous_ports: std::collections::BTreeSet<String>,
     pub control_port: u16,
     pub http_port: u16,
     pub writer: FrameWriter,

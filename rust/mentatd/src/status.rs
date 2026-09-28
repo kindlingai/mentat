@@ -29,6 +29,8 @@ fn probe_table(p: &PeerInfo) -> Value {
                                 "rtt_ms": r.rtt_ms,
                                 "last_ok_ms": r.last_ok_ms,
                                 "error": r.error,
+                                "neighbour_mac": r.neighbour_mac,
+                                "direct": r.direct,
                             }),
                         )
                     })
@@ -117,6 +119,7 @@ pub fn peer_row(p: &PeerInfo) -> Value {
         "addrs": p.addrs,
         "addr_tags": p.addr_tags,
         "addr_ifaces": p.addr_ifaces,
+        "addr_macs": p.addr_macs,
         "probes": probe_table(p),
         "control_port": p.control_port,
         "http_port": p.http_port,
@@ -251,6 +254,7 @@ pub fn snapshot(st: &State, scope: Option<&str>) -> Value {
         "addrs": crate::announce::local_addrs(),
         "addr_tags": crate::announce::local_addr_tags(),
         "addr_ifaces": crate::announce::local_addr_ifaces(),
+        "addr_macs": crate::announce::local_addr_macs(),
         "hostname": st.hostname,
         // `node_ip` and `control_port`, as every peer row spells it. The
         // announcement keeps `control` as one string for spark-agent.
@@ -327,6 +331,25 @@ pub fn render(data: &Value, scoped: bool) -> String {
         data["hostname"].as_str().unwrap_or("?"),
         if is_head { " [head]" } else { "" },
     ));
+    // MAC to the node_ip of the box that owns it, to name the box that
+    // forwards a pair.
+    let mut mac_owner: std::collections::BTreeMap<&str, &str> = Default::default();
+    for (node_ip, macs) in std::iter::once((&data["node_ip"], &data["addr_macs"])).chain(
+        data["peers"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(_, p)| (&p["node_ip"], &p["addr_macs"])),
+    ) {
+        for mac in macs
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, m)| m.as_str())
+        {
+            mac_owner.insert(mac, node_ip.as_str().unwrap_or("?"));
+        }
+    }
     for (pid, p) in data["peers"].as_object().into_iter().flatten() {
         out.push_str(&format!(
             "peer {}... {} alive={}{}\n",
@@ -349,10 +372,16 @@ pub fn render(data: &Value, scoped: bool) -> String {
                 .into_iter()
                 .flatten()
                 .map(|(remote, r)| {
-                    if r["ok"].as_bool().unwrap_or(false) {
-                        format!("{remote}=ok/{}ms", r["rtt_ms"].as_u64().unwrap_or(0))
-                    } else {
+                    let rtt = r["rtt_ms"].as_u64().unwrap_or(0);
+                    if !r["ok"].as_bool().unwrap_or(false) {
                         format!("{remote}=fail")
+                    } else if r["direct"] == false {
+                        // Another box answered ARP for the peer and forwards.
+                        let mac = r["neighbour_mac"].as_str().unwrap_or("?");
+                        let via = mac_owner.get(mac).copied().unwrap_or(mac);
+                        format!("{remote}=fwd({via})/{rtt}ms")
+                    } else {
+                        format!("{remote}=ok/{rtt}ms")
                     }
                 })
                 .collect();
@@ -483,6 +512,39 @@ mod tests {
             return None;
         }
         Some(cand.to_string())
+    }
+
+    #[test]
+    fn a_pair_through_another_box_reads_fwd() {
+        let data = serde_json::json!({
+            "control_port": 6379, "hostname": "y", "node_id": "a", "head_node_id": "a",
+            "peers": {
+                "bbbbbbbbbb": { "node_ip": "10.0.0.2", "alive": true,
+                    "addr_macs": {"10.0.0.2": "aa:00:00:00:00:02"},
+                    "probes": {
+                        "10.0.0.1": {
+                            "10.0.0.2": {"ok": true, "rtt_ms": 0, "direct": true},
+                            "10.0.0.6": {"ok": false, "direct": null}},
+                        "192.168.1.70": {"192.168.1.71": {"ok": true, "rtt_ms": 0}}}},
+                "cccccccccc": { "node_ip": "10.0.0.4", "alive": true,
+                    "addr_macs": {"10.0.0.4": "aa:00:00:00:00:04"},
+                    "probes": {"10.0.0.1": {"10.0.0.4": {"ok": true, "rtt_ms": 1,
+                        "direct": false, "neighbour_mac": "aa:00:00:00:00:02"}}}}},
+            "groups": {}
+        });
+        let text = render(&data, false);
+        assert!(
+            text.contains("reach from 10.0.0.1: 10.0.0.2=ok/0ms 10.0.0.6=fail\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("reach from 10.0.0.1: 10.0.0.4=fwd(10.0.0.2)/1ms\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("reach from 192.168.1.70: 192.168.1.71=ok/0ms\n"),
+            "{text}"
+        );
     }
 
     #[test]
