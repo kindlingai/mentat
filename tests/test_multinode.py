@@ -15,6 +15,7 @@ itself the test that those knobs work.
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 
@@ -338,6 +339,73 @@ def t08_the_snapshot_states_the_stream_position():
     assert first["data"]["boot_id"] == snap["boot_id"]
 
 
+RESTART_DRIVER = """
+import os, sys, time
+sys.path[:0] = os.environ["PYTHONPATH"].split(os.pathsep)
+import ray
+from ray.util.placement_group import placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy as PGS
+from fake_worker import FakeWorker
+ray.init()
+pg = placement_group([{"GPU": 1.0}, {"GPU": 1.0}])
+assert ray.wait([pg.ready()], timeout=15)[0]
+ws = [ray.remote(FakeWorker).options(
+          num_gpus=1, scheduling_strategy=PGS(placement_group=pg,
+                                              placement_group_bundle_index=r)).remote(rank=r)
+      for r in range(2)]
+ray.get([w.pid.remote() for w in ws], timeout=30)
+refs = [w.block_forever.remote() for w in ws]
+print("READY", flush=True)
+# vLLM's monitor: a finished run() ref is a dead worker.
+end = time.time() + float(sys.stdin.readline())
+while time.time() < end:
+    try:
+        done, _ = ray.wait(refs, num_returns=1, timeout=0.2)
+    except Exception as e:
+        print("ERROR", repr(e), flush=True)
+        sys.exit(1)
+    if done:
+        print("DONE", flush=True)
+        sys.exit(1)
+print("OK", flush=True)
+"""
+
+
+def t09_a_restarted_head_keeps_every_rank():
+    """The restarted head knew no refs until each agent re-registered, and
+    it answered an unknown ref as finished. The driver's monitor read the
+    worker's run() ref as a dead rank, and vLLM shut the engine down, which
+    reaps every actor on every node."""
+    env = {**MESH_ENV, "MENTAT_ANNOUNCE_ADDRS": "127.0.0.1=lan"}
+    h = Daemon("127.0.0.4", env=env).wait_up()
+    w = Daemon("127.0.0.5", peers=[f"127.0.0.1:{h.port}"], env=env).wait_up()
+    state.update(rh=h, rw=w)
+    h_id = h.status_json()["node_id"]
+    wait_for(lambda: w.status_json()["head_node_id"] == h_id, 20, "h to lead the pair")
+    h.start_agent("rs", gpus=1, container="ch")
+    w.start_agent("rs", gpus=1, container="cw")
+    wait_for(lambda: h.status_json("rs")["groups"].get("rs", {}).get("gpus_total") == 2,
+             20, "both agents on h")
+
+    p = subprocess.Popen(
+        [sys.executable, "-c", RESTART_DRIVER],
+        env={**os.environ, "RAY_ADDRESS": h.address, "MENTAT_GROUP": "rs",
+             "PYTHONPATH": os.pathsep.join([tl.PYTHON_PKG, HERE])},
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+    )
+    tl._children.append(p)
+    assert p.stdout.readline().strip() == "READY"
+    p.stdin.write("15\n")
+    p.stdin.flush()
+
+    port = h.port
+    h.kill()
+    time.sleep(1.0)
+    state["rh"] = Daemon("127.0.0.4", port=port, env=env).wait_up()
+    line = p.stdout.readline().strip()
+    assert line == "OK", f"a rank read as dead across the head restart: {line}"
+
+
 def main():
     tests = [
         t01_workers_first_then_head,
@@ -349,6 +417,7 @@ def main():
         t06_peer_staleness_and_recovery,
         t07_a_lost_peer_is_marked_then_forgotten,
         t08_the_snapshot_states_the_stream_position,
+        t09_a_restarted_head_keeps_every_rank,
     ]
     try:
         for t in tests:
@@ -359,7 +428,7 @@ def main():
             state.get("ray") and state["ray"].shutdown()
         except Exception:
             pass
-        for k in ("d1", "d2", "d3"):
+        for k in ("d1", "d2", "d3", "rh", "rw"):
             if k in state:
                 state[k].cleanup()
 

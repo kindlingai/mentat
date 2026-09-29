@@ -800,6 +800,7 @@ fn elector(shared: SharedRef) {
         if since.elapsed() >= hold_down {
             let old = std::mem::replace(&mut st.head_node_id, candidate.clone());
             st.head_generation += 1;
+            st.head_since_ms = (candidate == st.node_id).then(now_ms_u64);
             let generation = st.head_generation;
             st.emit_patch(
                 "head_change",

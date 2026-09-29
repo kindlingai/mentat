@@ -13,6 +13,7 @@ import os
 import socket
 import struct
 import threading
+import time
 import uuid
 
 
@@ -110,6 +111,15 @@ def peer_closed(sock):
         return True
 
 
+def reconnect_s():
+    """MENTAT_RECONNECT_MS in seconds, 60 by default. An unparsable value
+    uses the default."""
+    try:
+        return int(os.environ.get("MENTAT_RECONNECT_MS") or 60000) / 1000
+    except ValueError:
+        return 60.0
+
+
 def read_frame_from(sock):
     hlen, plen = struct.unpack("<II", recv_exact(sock, 8))
     header = json.loads(recv_exact(sock, hlen))
@@ -166,6 +176,26 @@ class Connection:
                 f"mentat: daemon proto {offered!r}, this shim {PROTO}"
             )
 
+    def _redial(self):
+        """Dial again after the connection dropped.
+
+        A restarting daemon refuses connections for a few seconds, and
+        vLLM's monitor reads an exception from ray.wait as a dead worker. So
+        a refused dial is retried until MENTAT_RECONNECT_MS has passed.
+        Nothing is sent on a refused dial, so retrying it is safe for any
+        request.
+        """
+        deadline = time.monotonic() + reconnect_s()
+        while True:
+            try:
+                self._dial()
+                return
+            except OSError:
+                self._drop()
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.5)
+
     def _drop(self):
         if self.sock is not None:
             try:
@@ -198,12 +228,12 @@ class Connection:
             # A connection dropped by an earlier failure holds nothing, so
             # dialing here costs the caller one round trip and no risk.
             if self.sock is None:
-                self._dial()
+                self._redial()
             try:
                 resp, rp = self._exchange(header, payload)
             except _Undelivered:
                 self._drop()
-                self._dial()
+                self._redial()
                 resp, rp = self._exchange(header, payload)
             except (OSError, ConnectionError):
                 # The frame went out and no answer came back, so the daemon
@@ -211,7 +241,7 @@ class Connection:
                 self._drop()
                 if not retry:
                     raise
-                self._dial()
+                self._redial()
                 resp, rp = self._exchange(header, payload)
         return _checked((resp, rp), expect)
 

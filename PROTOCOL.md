@@ -219,7 +219,7 @@ A node row. The daemon's own node is always present:
 | `state` | `PENDING`, `CREATED` or `REMOVED` |
 | `timeout_ms?` | Null blocks, 0 polls. Omitted is null, so a caller that leaves it out waits forever |
 | `ref_get_ok.status` | `ok`, `error`, `actor_died` or `timeout`, with `reason` filled for `actor_died` |
-| An unknown `ref_id` | `ref_get` returns `err`. `ref_wait` counts it ready, since the daemon will never resolve a ref it never held |
+| An unknown `ref_id` | Pending for `MENTAT_AGENT_DEAD_AFTER_MS` after the daemon became head, since an agent that has not re-registered yet brings its refs when it does. After that, `ref_get` returns `err` and `ref_wait` counts it ready, since the daemon will never resolve a ref it never held |
 
 `actor_stop` kills one group's actors, or every group's with `all`. The
 agents stay registered and the driver reconnects, so the group continues. A

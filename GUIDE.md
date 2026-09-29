@@ -607,7 +607,9 @@ degraded. Calls stay held. The event is `agent_degraded`.
 
 How long an agent's daemon link may be closed before its actors are marked
 dead, which resolves their `run()` refs and restarts the driver. The gap
-between this and the degrade threshold allows for short outages.
+between this and the degrade threshold allows for short outages. A daemon
+that has just become head also treats a ref it does not know as pending for
+this long, since the agent holding it may not have re-registered yet.
 
 - `MENTAT_HISTORY_KEEP_MS` (default 600000)
 
@@ -666,6 +668,13 @@ Target time for TCP keepalive to declare a wedged peer dead, set through
 
 Daemon the driver and the CLI connect to. Any daemon relays to the head, so
 the default is correct on every node. See "Daemon address".
+
+- `MENTAT_RECONNECT_MS` (default 60000)
+
+How long the shim redials a daemon that dropped its connection before a
+call fails. A restarting daemon refuses connections for a few seconds, and
+vLLM reads an exception from its monitor's `ray.wait` as a dead worker. The
+first dial at `ray.init` does not retry.
 
 - `MENTAT_DAEMON` (default: the `--address` flag, then `127.0.0.1:6379`)
 

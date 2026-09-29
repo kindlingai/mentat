@@ -1743,11 +1743,57 @@ fn resolve_ref(st: &State, ref_id: &str) -> Res {
     }
 }
 
+/// How long an unknown ref may yet arrive, or None once it cannot.
+///
+/// A daemon that just became head knows only the refs of agents that have
+/// re-registered with it. Each other agent re-sends its refs when it
+/// arrives, and the daemon gives up on a lost agent after
+/// MENTAT_AGENT_DEAD_AFTER_MS. Until then an unknown ref is pending. vLLM
+/// reads a finished `run()` ref as a dead worker and shuts the engine down.
+fn unknown_ref_window(st: &State) -> Option<Duration> {
+    let since = st.head_since_ms?;
+    let left = (since + cfg().agent_dead_after_ms).saturating_sub(crate::state::now_ms_u64());
+    (left > 0).then(|| Duration::from_millis(left))
+}
+
+/// How long to sleep for a ref to change: until `deadline`, and no later
+/// than the end of the unknown-ref window when `unknown` refs are waited on.
+fn wait_for_refs<'a>(
+    shared: &'a SharedRef,
+    st: std::sync::MutexGuard<'a, State>,
+    deadline: Option<Instant>,
+    unknown: bool,
+) -> std::sync::MutexGuard<'a, State> {
+    let window = unknown.then(|| unknown_ref_window(&st)).flatten();
+    let now = Instant::now();
+    let until = match (deadline, window) {
+        (Some(d), Some(w)) => Some(d.min(now + w)),
+        (d, w) => d.or(w.map(|w| now + w)),
+    };
+    match until {
+        Some(u) => {
+            shared
+                .cv
+                .wait_timeout(st, u.saturating_duration_since(now))
+                .unwrap()
+                .0
+        }
+        None => shared.cv.wait(st).unwrap(),
+    }
+}
+
 fn do_get(shared: &SharedRef, ref_id: &str, timeout_ms: Option<u64>) -> (Msg, Vec<u8>) {
     let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
     let mut st = shared.st.lock().unwrap();
     loop {
-        match resolve_ref(&st, ref_id) {
+        let res = resolve_ref(&st, ref_id);
+        let unknown = matches!(res, Res::Unknown);
+        let res = if unknown && unknown_ref_window(&st).is_some() {
+            Res::Pending
+        } else {
+            res
+        };
+        match res {
             Res::Ready { ok, payload } => {
                 return (
                     Msg::RefGetOk {
@@ -1769,25 +1815,16 @@ fn do_get(shared: &SharedRef, ref_id: &str, timeout_ms: Option<u64>) -> (Msg, Ve
             Res::Unknown => return refused("unknown_ref", format!("unknown ref {ref_id}")),
             Res::Pending => {}
         }
-        match deadline {
-            Some(d) => {
-                let now = Instant::now();
-                if now >= d {
-                    return (
-                        Msg::RefGetOk {
-                            status: "timeout".into(),
-                            reason: String::new(),
-                        },
-                        Vec::new(),
-                    );
-                }
-                let (g, _) = shared.cv.wait_timeout(st, d - now).unwrap();
-                st = g;
-            }
-            None => {
-                st = shared.cv.wait(st).unwrap();
-            }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return (
+                Msg::RefGetOk {
+                    status: "timeout".into(),
+                    reason: String::new(),
+                },
+                Vec::new(),
+            );
         }
+        st = wait_for_refs(shared, st, deadline, unknown);
     }
 }
 
@@ -1801,9 +1838,18 @@ fn do_wait(
     let want = num_returns.min(ref_ids.len());
     let mut st = shared.st.lock().unwrap();
     loop {
+        let arriving = unknown_ref_window(&st).is_some();
+        let mut unknown = false;
         let ready: Vec<String> = ref_ids
             .iter()
-            .filter(|r| !matches!(resolve_ref(&st, r), Res::Pending))
+            .filter(|r| match resolve_ref(&st, r) {
+                Res::Pending => false,
+                Res::Unknown => {
+                    unknown = true;
+                    !arriving
+                }
+                _ => true,
+            })
             .cloned()
             .collect();
         if ready.len() >= want {
@@ -1811,19 +1857,10 @@ fn do_wait(
             let capped: Vec<String> = ready.into_iter().take(num_returns).collect();
             return (Msg::RefWaitOk { ready: capped }, Vec::new());
         }
-        match deadline {
-            Some(d) => {
-                let now = Instant::now();
-                if now >= d {
-                    return (Msg::RefWaitOk { ready }, Vec::new());
-                }
-                let (g, _) = shared.cv.wait_timeout(st, d - now).unwrap();
-                st = g;
-            }
-            None => {
-                st = shared.cv.wait(st).unwrap();
-            }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return (Msg::RefWaitOk { ready }, Vec::new());
         }
+        st = wait_for_refs(shared, st, deadline, unknown);
     }
 }
 

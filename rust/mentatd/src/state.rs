@@ -357,6 +357,10 @@ pub struct State {
     /// group. mesh::elector has the rule.
     pub head_node_id: NodeId,
     pub head_generation: u64,
+    /// When this daemon last became head, or None while another daemon is.
+    /// Until MENTAT_AGENT_DEAD_AFTER_MS past it, agents are still arriving
+    /// with the refs they hold.
+    pub head_since_ms: Option<u64>,
     pub agents: HashMap<AgentId, AgentInfo>,
     pub actors: HashMap<ActorId, ActorInfo>,
     pub pgs: HashMap<PgId, PgInfo>,
@@ -406,6 +410,7 @@ impl State {
         State {
             head_node_id: String::new(),
             head_generation: 0,
+            head_since_ms: None,
             fabrics: crate::island::Fabrics::default(),
             peers: HashMap::new(),
             dialing: std::collections::BTreeSet::new(),
