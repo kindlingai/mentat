@@ -1214,6 +1214,133 @@ mod tests {
         assert_eq!(r.sets[0].layout, Layout::Ring);
     }
 
+    /// Every node pair on `n` nodes is absent, a cable or forwarded, as
+    /// `state(pair_index)` says: 0, 1 or 2. Each node has one rdma port.
+    fn graph(n: usize, state: impl Fn(usize) -> u8) -> Topology {
+        let mut t = Topology::default();
+        for i in 0..n {
+            t.ports.insert(
+                format!("n{i}"),
+                vec![port(&format!("10.0.0.{i}"), "p", &["rdma"])],
+            );
+            t.free_gpus.insert(format!("n{i}"), 1.0);
+        }
+        for (k, (i, j)) in pairs(n).into_iter().enumerate() {
+            let key = (format!("10.0.0.{i}"), format!("10.0.0.{j}"));
+            match state(k) {
+                1 => {
+                    t.links.insert(key, 0);
+                }
+                2 => {
+                    t.links.insert(key.clone(), 0);
+                    t.forwarded.insert(key);
+                }
+                _ => {}
+            }
+        }
+        t
+    }
+
+    fn pairs(n: usize) -> Vec<(usize, usize)> {
+        (0..n)
+            .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
+            .collect()
+    }
+
+    /// Read from the tables directly, so the check shares no code with the
+    /// solver.
+    fn cable(t: &Topology, a: &str, b: &str) -> bool {
+        let (x, y) = (&t.ports[a][0].addr, &t.ports[b][0].addr);
+        let there = |k: &dyn Fn(&(String, String)) -> bool| {
+            k(&(x.clone(), y.clone())) || k(&(y.clone(), x.clone()))
+        };
+        there(&|p| t.links.contains_key(p)) && !there(&|p| t.forwarded.contains(p))
+    }
+
+    /// Whether `order` is a ring or line over cables.
+    fn valid(t: &Topology, layout: Layout, order: &[String]) -> bool {
+        let k = order.len();
+        let steps = order.windows(2).all(|w| cable(t, &w[0], &w[1]));
+        let closes = layout != Layout::Ring || k < 3 || cable(t, &order[k - 1], &order[0]);
+        steps && closes
+    }
+
+    /// Every order of `k` distinct nodes out of `n`.
+    fn orders(n: usize, k: usize) -> Vec<Vec<String>> {
+        fn go(n: usize, k: usize, cur: &mut Vec<usize>, out: &mut Vec<Vec<String>>) {
+            if cur.len() == k {
+                out.push(cur.iter().map(|i| format!("n{i}")).collect());
+                return;
+            }
+            for i in 0..n {
+                if !cur.contains(&i) {
+                    cur.push(i);
+                    go(n, k, cur, out);
+                    cur.pop();
+                }
+            }
+        }
+        let mut out = Vec::new();
+        go(n, k, &mut Vec::new(), &mut out);
+        out
+    }
+
+    /// Solve every size and layout on `t` and hold the answer to brute
+    /// force: an answer is a chain over cables, and there is one exactly
+    /// when some order of the nodes is.
+    fn check_every_request(t: &Topology, n: usize) {
+        for layout in [Layout::Ring, Layout::Line] {
+            for k in 1..=n {
+                let exists = orders(n, k).iter().any(|o| valid(t, layout, o));
+                let got = solve(t, &laid_out("s", k, layout));
+                assert_eq!(got.is_ok(), exists, "{layout:?} of {k} on {:?}", t.links);
+                let Ok(sol) = got else { continue };
+                let order: Vec<String> = sol.sets["s"].iter().map(|m| m.node.clone()).collect();
+                assert!(
+                    valid(t, layout, &order),
+                    "{layout:?} {order:?} on {:?}",
+                    t.links
+                );
+                if layout == Layout::Ring {
+                    assert_eq!(order.iter().min(), order.first(), "{order:?}");
+                }
+                for (i, m) in sol.sets["s"].iter().enumerate() {
+                    let at = |j: usize| order[j].clone();
+                    let next = match layout {
+                        Layout::Ring if k > 1 => Some(at((i + 1) % k)),
+                        Layout::Line if i + 1 < k => Some(at(i + 1)),
+                        _ => None,
+                    };
+                    assert_eq!(m.next.as_ref().map(|p| p.to.clone()), next, "{order:?}");
+                    if let Some(p) = m.next.as_ref().or(m.prev.as_ref()) {
+                        assert_eq!(m.bind, p.local, "{order:?}");
+                    }
+                }
+                assert_eq!(solve(t, &laid_out("s", k, layout)).unwrap(), sol);
+            }
+        }
+    }
+
+    /// Every graph on five nodes, each pair cabled or not.
+    #[test]
+    fn every_ring_and_line_on_five_nodes_matches_brute_force() {
+        let n = 5;
+        for bits in 0u32..1 << pairs(n).len() {
+            check_every_request(&graph(n, |k| (bits >> k & 1) as u8), n);
+        }
+    }
+
+    /// Every graph on four nodes, each pair absent, cabled or forwarded. A
+    /// forwarded pair must never carry a ring or a line.
+    #[test]
+    fn every_ring_and_line_on_four_nodes_skips_forwarded_pairs() {
+        let n = 4;
+        let m = pairs(n).len() as u32;
+        for code in 0..3u32.pow(m) {
+            check_every_request(&graph(n, |k| (code / 3u32.pow(k as u32) % 3) as u8), n);
+        }
+    }
+
     #[test]
     fn link_names() {
         assert_eq!(Link::parse("roce"), Ok(Link::Rdma));
