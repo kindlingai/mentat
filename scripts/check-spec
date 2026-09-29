@@ -3,9 +3,10 @@
 # fail. Each configuration is spec/HeadDaemon.cfg with edits applied.
 #
 # The fixed model must pass in both grace modes, at three devices and three
-# groups. Each Bug constant, set alone, restores a defect that shipped, and
-# the property that defect broke must fail. A variant that passes means the
-# spec has lost the ability to find that bug.
+# groups, and with claims or the restart outage switched on, at two of each.
+# Each Bug constant, set alone, restores a defect, and the property that
+# defect broke must fail. A variant that passes means the spec has lost the
+# ability to find that bug.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -65,5 +66,28 @@ check bug-reap-reconnected "Action property SessionKeepsActors is violated" \
 check bug-stale-timer "Action property GraceHoldsActors is violated" \
     -e 's/BugStaleTimer = FALSE/BugStaleTimer = TRUE/' \
     -e 's/^INVARIANTS.*/INVARIANTS TypeOK/' -e 's/^PROPERTIES.*/PROPERTIES GraceHoldsActors/'
+
+check fixed-claims pass -e 's/ModelClaims = FALSE/ModelClaims = TRUE/'
+check fixed-outage pass -e 's/ModelOutage = FALSE/ModelOutage = TRUE/'
+
+claims="s/ModelClaims = FALSE/ModelClaims = TRUE/"
+outage="s/ModelOutage = FALSE/ModelOutage = TRUE/"
+only() { echo "s/^INVARIANTS.*/INVARIANTS TypeOK $1/"; }
+
+check bug-claim-spill "Invariant ClaimFence is violated" \
+    -e "$claims" -e 's/BugClaimSpill = FALSE/BugClaimSpill = TRUE/' \
+    -e "$(only ClaimFence)" -e '/^PROPERTIES/d'
+check bug-claim-kept "Invariant ClaimHeld is violated" \
+    -e "$claims" -e 's/BugClaimKept = FALSE/BugClaimKept = TRUE/' \
+    -e "$(only ClaimHeld)" -e '/^PROPERTIES/d'
+check bug-no-rotate "Invariant RankZeroOnDriver is violated" \
+    -e "$claims" -e 's/BugNoRotate = FALSE/BugNoRotate = TRUE/' \
+    -e "$(only RankZeroOnDriver)" -e '/^PROPERTIES/d'
+check bug-no-redial "Invariant NoFalseDeath is violated" \
+    -e "$outage" -e 's/BugNoRedial = FALSE/BugNoRedial = TRUE/' \
+    -e "$(only NoFalseDeath)" -e '/^PROPERTIES/d'
+check bug-unknown-ref-ready "Invariant NoFalseDeath is violated" \
+    -e "$outage" -e 's/BugUnknownRefReady = FALSE/BugUnknownRefReady = TRUE/' \
+    -e "$(only NoFalseDeath)" -e '/^PROPERTIES/d'
 
 exit $failed
