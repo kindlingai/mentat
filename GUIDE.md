@@ -474,6 +474,21 @@ The shim reads `MENTAT_CLAIM` and `MENTAT_CLAIM_SHAPE` at
 the claim. A group requesting more than its claim holds stays PENDING.
 [PROTOCOL.md](PROTOCOL.md) defines the shape.
 
+A set's layout is `mesh`, `ring` or `line`. A mesh is one island. A ring or
+a line is built from probed cables. Four boxes cabled in a loop can host a
+four-rank ring, though no island has four members. `MENTAT_CLAIM_LAYOUT=ring`
+asks for a ring without writing a shape:
+
+```bash
+export MENTAT_CLAIM=tp4 MENTAT_CLAIM_LAYOUT=ring
+vllm serve ... --distributed-executor-backend ray -tp 4
+```
+
+Rank `i` of a ring or line sits on member `i`. The ring starts at the
+driver's node, where vLLM puts rank 0. A line starts at whichever end the
+driver is on. A driver on an inner node of a line leaves the group PENDING.
+Each rank gets its neighbours' addresses, listed under "Actor process".
+
 ## Environment
 
 An unset or empty variable uses its default. An unparsable `*_MS` value
@@ -707,6 +722,12 @@ Claim this name before placing, and place inside the claim. See "Claims".
 The shape to claim, as JSON. Invalid JSON raises at
 `ray.util.placement_group`.
 
+- `MENTAT_CLAIM_LAYOUT` (default: `mesh`)
+
+The layout of the default shape's set: `mesh`, `ring` or `line`. Ignored
+when `MENTAT_CLAIM_SHAPE` is set, since that shape names its own. See
+"Claims".
+
 - `MENTAT_GPUS` (default: what `nvidia-smi` reports)
 
 Reports this many placeholder devices, for tests on nodes without GPUs. The
@@ -763,6 +784,19 @@ The agent sets these on each actor process. `MENTAT_ACTOR_ID`,
 `MENTAT_NODE_ID`, `MENTAT_GPU_IDS`, `MENTAT_GCS_ADDRESS` and
 `MENTAT_AGENT_PID` are always set. `MENTAT_FABRIC_IP` is set when the group
 was placed on a fabric island and gives this rank's address on it.
+
+A rank placed by a ring or line claim gets these variables in place of
+`MENTAT_FABRIC_IP`. No one address reaches every rank of a ring.
+
+| Variable | Value |
+| --- | --- |
+| `MENTAT_FABRIC_LAYOUT` | `ring` or `line` |
+| `MENTAT_FABRIC_NEXT`, `MENTAT_FABRIC_PREV` | The next and previous rank's address on the cable to this rank |
+| `MENTAT_FABRIC_NEXT_IFACE`, `MENTAT_FABRIC_PREV_IFACE` | This rank's interface on that cable |
+| `MENTAT_FABRIC_IFACES` | Both interfaces, comma-separated. `NCCL_IB_HCA` takes the RDMA device behind each, which `/sys/class/net/<iface>/device/infiniband` names |
+
+A line's first rank has no `PREV` pair and its last rank has no `NEXT`
+pair.
 
 ## Files
 

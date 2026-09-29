@@ -1639,6 +1639,7 @@ fn create_actor(
     if let Some(ip) = fabric_ip {
         spawn_env.insert("MENTAT_FABRIC_IP".into(), ip);
     }
+    spawn_env.extend(bundle.env);
 
     st.actors.insert(
         actor_id.clone(),
@@ -2060,14 +2061,26 @@ pub fn try_place(st: &mut State, cv: &std::sync::Condvar) {
             .map(|c| c.node_id.clone())
             .unwrap_or_default();
 
-        let placed = match placement_scopes(st, &group, &bundles, &driver_node, &claim) {
-            Ok(scopes) => scopes.into_iter().find_map(|(island, nodes)| {
-                fit(st, &group, &bundles, &driver_node, nodes.as_deref()).map(|a| (island, a))
-            }),
-            Err(why) => {
-                set_pending_reason(st, &pg_id, why);
-                continue;
-            }
+        let ordered = (!claim.is_empty())
+            .then(|| claim_order(st, &group, &claim, &driver_node))
+            .flatten();
+        let placed = match ordered {
+            Some(order) => match order.and_then(|o| fit_ordered(st, &group, &bundles, o)) {
+                Ok(a) => Some((None, a)),
+                Err(why) => {
+                    set_pending_reason(st, &pg_id, why);
+                    continue;
+                }
+            },
+            None => match placement_scopes(st, &group, &bundles, &driver_node, &claim) {
+                Ok(scopes) => scopes.into_iter().find_map(|(island, nodes)| {
+                    fit(st, &group, &bundles, &driver_node, nodes.as_deref()).map(|a| (island, a))
+                }),
+                Err(why) => {
+                    set_pending_reason(st, &pg_id, why);
+                    continue;
+                }
+            },
         };
         let Some((island, assignment)) = placed else {
             let why = no_fit_reason(st, &group, &bundles);
@@ -2273,6 +2286,7 @@ fn fit(
                     agent: agent_id.clone(),
                     node_id: st.agents[agent_id].node_id.clone(),
                     gpu_ids,
+                    env: Default::default(),
                 });
                 break;
             }
@@ -2280,6 +2294,145 @@ fn fit(
         assignment.push(Some(placed?));
     }
     Some(assignment)
+}
+
+/// For each rank in order: its node id, and the variables placement adds
+/// to its environment.
+type RankOrder = Vec<(String, BTreeMap<String, String>)>;
+
+/// The rank order for a claim of one ring or line set, as this driver
+/// needs it. None for any other claim.
+///
+/// vLLM expects rank 0 on the driver's node. A ring is rotated to put it
+/// there. A line is reversed when the driver is on its far end, and refused
+/// when the driver is inside it, since no order then has rank 0 on the
+/// driver's node.
+fn claim_order(
+    st: &State,
+    group: &str,
+    claim: &str,
+    driver_node: &str,
+) -> Option<Result<RankOrder, String>> {
+    use crate::claim::Layout;
+    let c = st.claims.get(&(group.to_string(), claim.to_string()))?;
+    let req = crate::claim::parse(&c.shape).ok()?;
+    let [set] = req.sets.as_slice() else {
+        return None;
+    };
+    if !set.layout.ordered() {
+        return None;
+    }
+    let mut order: Vec<(String, Value, Value)> = c.view["sets"][&set.name]
+        .as_array()?
+        .iter()
+        .map(|m| {
+            (
+                m["node"].as_str().unwrap_or_default().to_string(),
+                m["prev"].clone(),
+                m["next"].clone(),
+            )
+        })
+        .collect();
+    let last = order.len().saturating_sub(1);
+    match (
+        set.layout,
+        order.iter().position(|(n, ..)| n == driver_node),
+    ) {
+        (Layout::Ring, Some(i)) => order.rotate_left(i),
+        (Layout::Line, Some(i)) if i == last && i > 0 => {
+            order.reverse();
+            for m in &mut order {
+                std::mem::swap(&mut m.1, &mut m.2);
+            }
+        }
+        (Layout::Line, Some(i)) if i > 0 => {
+            return Some(Err(format!(
+                "claim {claim:?} is a line and the driver's node is inside it. Start \
+                 the driver on a node at one end of the line"
+            )))
+        }
+        _ => {}
+    }
+    Some(Ok(order
+        .into_iter()
+        .map(|(n, prev, next)| (n, rank_env(set.layout, &prev, &next)))
+        .collect()))
+}
+
+/// The variables that name a ring or line rank's neighbours: each
+/// neighbour's address and the local interface that reaches it.
+fn rank_env(layout: crate::claim::Layout, prev: &Value, next: &Value) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    let name = if layout == crate::claim::Layout::Ring {
+        "ring"
+    } else {
+        "line"
+    };
+    env.insert("MENTAT_FABRIC_LAYOUT".to_string(), name.to_string());
+    let mut ifaces: Vec<&str> = Vec::new();
+    for (key, p) in [("PREV", prev), ("NEXT", next)] {
+        if let Some(addr) = p["addr"].as_str() {
+            env.insert(format!("MENTAT_FABRIC_{key}"), addr.to_string());
+        }
+        if let Some(iface) = p["iface"].as_str() {
+            env.insert(format!("MENTAT_FABRIC_{key}_IFACE"), iface.to_string());
+            if !ifaces.contains(&iface) {
+                ifaces.push(iface);
+            }
+        }
+    }
+    if !ifaces.is_empty() {
+        env.insert("MENTAT_FABRIC_IFACES".to_string(), ifaces.join(","));
+    }
+    env
+}
+
+/// Bundle `i` on the `i`-th node of `order`, on the first agent of the
+/// group there, by registration order, with enough free GPUs.
+fn fit_ordered(
+    st: &State,
+    group: &str,
+    bundles: &[u32],
+    order: RankOrder,
+) -> Result<Vec<Option<BundleAssignment>>, String> {
+    if bundles.len() != order.len() {
+        return Err(format!(
+            "the claim orders {} nodes and the group asks for {} bundles",
+            order.len(),
+            bundles.len()
+        ));
+    }
+    let mut free: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    let mut out = Vec::with_capacity(bundles.len());
+    for (spec, (node, env)) in bundles.iter().zip(order) {
+        let need = (*spec).max(1) as usize;
+        let mut agents: Vec<(u64, String)> = st
+            .agents
+            .values()
+            .filter(|a| a.alive && a.group == group && a.node_id == node)
+            .map(|a| (a.seq, a.id.clone()))
+            .collect();
+        agents.sort();
+        let found = agents.into_iter().find_map(|(_, id)| {
+            let f = free
+                .entry(id.clone())
+                .or_insert_with(|| st.free_gpus_of(&id));
+            (f.len() >= need).then(|| (id, f.drain(..need).collect::<Vec<u32>>()))
+        });
+        let Some((agent, gpu_ids)) = found else {
+            let host = crate::state::node_ip_of(&node).unwrap_or_else(|| node.clone());
+            return Err(format!(
+                "the claim's node {host} has no agent of group '{group}' with {need} free GPUs"
+            ));
+        };
+        out.push(Some(BundleAssignment {
+            agent,
+            node_id: node,
+            gpu_ids,
+            env,
+        }));
+    }
+    Ok(out)
 }
 
 /// Why each island is too small for this group: the nodes it needs on a
@@ -2876,8 +3029,9 @@ fn agent_conn(
 
 #[cfg(test)]
 mod tests {
-    use super::{claim, misfiled, orphans_of, sweep_history};
+    use super::{claim, claim_order, fit_ordered, misfiled, orphans_of, sweep_history, RankOrder};
     use crate::state::{ActorInfo, ActorState, ClientInfo, State};
+    use serde_json::{json, Value};
 
     /// A second holder spells the shape its own way and joins the claim it
     /// already holds. Going through `claim` covers the comparison the
@@ -3050,6 +3204,106 @@ mod tests {
             },
         );
         st
+    }
+
+    /// One agent with one GPU on each named node, and a claim `c` of one
+    /// set in `layout` over those nodes in that order. Member `i` reaches
+    /// member `i+1` from 10.0.i.1 to 10.0.i.2 on `pi`.
+    fn with_ordered_claim(layout: &str, nodes: &[&str]) -> State {
+        let mut st = State::new("10.0.0.1".into(), "box".into(), "10.0.0.1:6379".into());
+        for n in nodes {
+            st = with_agent(st, &format!("ag-{n}"));
+            st.agents.get_mut(&format!("ag-{n}")).unwrap().node_id = n.to_string();
+        }
+        let k = nodes.len();
+        let link = |i: usize, j: usize| {
+            json!({"node": nodes[j], "addr": format!("10.0.{i}.2"),
+                   "bind": format!("10.0.{i}.1"), "iface": format!("p{i}")})
+        };
+        let members: Vec<Value> = (0..k)
+            .map(|i| {
+                let mut m = json!({"node": nodes[i]});
+                if i + 1 < k || layout == "ring" {
+                    m["next"] = link(i, (i + 1) % k);
+                }
+                if i > 0 || layout == "ring" {
+                    m["prev"] = link((i + k - 1) % k, (i + k - 1) % k);
+                }
+                m
+            })
+            .collect();
+        let shape = json!({"sets": [{"name": "tp", "bundles": vec![1; k], "link": "rdma",
+                                     "layout": layout}]});
+        st.claims.insert(
+            ("g".into(), "c".into()),
+            crate::state::ClaimInfo {
+                shape: crate::claim::canonical(&shape),
+                view: json!({"sets": {"tp": members}, "between": []}),
+                generation: 1,
+                holders: Default::default(),
+            },
+        );
+        st
+    }
+
+    fn ranks(order: &RankOrder) -> Vec<&str> {
+        order.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// vLLM wants rank 0 on the driver's node, so a ring turns to put it
+    /// there. Each rank keeps its neighbours.
+    #[test]
+    fn a_ring_claim_starts_at_the_driver() {
+        let st = with_ordered_claim("ring", &["nA", "nB", "nC", "nD"]);
+        let order = claim_order(&st, "g", "c", "nC").unwrap().unwrap();
+        assert_eq!(ranks(&order), ["nC", "nD", "nA", "nB"]);
+        let env = &order[0].1;
+        assert_eq!(env["MENTAT_FABRIC_LAYOUT"], "ring");
+        assert_eq!(env["MENTAT_FABRIC_NEXT"], "10.0.2.2");
+        assert_eq!(env["MENTAT_FABRIC_NEXT_IFACE"], "p2");
+        assert_eq!(env["MENTAT_FABRIC_PREV_IFACE"], "p1");
+        assert_eq!(env["MENTAT_FABRIC_IFACES"], "p1,p2");
+
+        let placed = fit_ordered(&st, "g", &[1, 1, 1, 1], order).unwrap();
+        let on: Vec<&str> = placed
+            .iter()
+            .map(|b| b.as_ref().unwrap().agent.as_str())
+            .collect();
+        assert_eq!(on, ["ag-nC", "ag-nD", "ag-nA", "ag-nB"]);
+    }
+
+    /// A line cannot turn. With the driver on its far end it reverses, and
+    /// each rank's previous and next swap with it.
+    #[test]
+    fn a_line_claim_reverses_for_a_driver_at_its_far_end() {
+        let st = with_ordered_claim("line", &["nA", "nB", "nC"]);
+        let order = claim_order(&st, "g", "c", "nC").unwrap().unwrap();
+        assert_eq!(ranks(&order), ["nC", "nB", "nA"]);
+        assert!(!order[0].1.contains_key("MENTAT_FABRIC_PREV"));
+        assert_eq!(order[0].1["MENTAT_FABRIC_NEXT_IFACE"], "p1");
+        assert!(!order[2].1.contains_key("MENTAT_FABRIC_NEXT"));
+    }
+
+    #[test]
+    fn a_line_claim_with_the_driver_inside_is_refused() {
+        let st = with_ordered_claim("line", &["nA", "nB", "nC"]);
+        let e = claim_order(&st, "g", "c", "nB").unwrap().unwrap_err();
+        assert!(e.contains("inside"), "{e}");
+    }
+
+    /// A mesh claim keeps its pooled placement.
+    #[test]
+    fn a_mesh_claim_has_no_order() {
+        let st = with_ordered_claim("mesh", &["nA", "nB"]);
+        assert!(claim_order(&st, "g", "c", "nA").is_none());
+    }
+
+    #[test]
+    fn an_ordered_claim_needs_one_bundle_per_node() {
+        let st = with_ordered_claim("ring", &["nA", "nB"]);
+        let order = claim_order(&st, "g", "c", "nA").unwrap().unwrap();
+        let e = fit_ordered(&st, "g", &[1, 1, 1], order).unwrap_err();
+        assert!(e.contains("orders 2 nodes"), "{e}");
     }
 
     /// The old driver's reap sent the kill and ran placement while the

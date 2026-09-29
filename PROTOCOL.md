@@ -252,7 +252,20 @@ reserve the GPUs. Two groups may claim one node and compete for its devices.
 | --- | --- |
 | `bundles` | A count of nodes at one GPU each, or a list of GPUs per node |
 | `link` | `rdma` or `ip`. An `rdma` set goes inside one fabric island (see "Placement") |
+| `layout?` | `mesh` (the default), `ring` or `line` |
 | `vendor` | Pins the set to one GPU vendor. Without it the daemon picks one |
+
+A `mesh` set is one island: every member links to every other. A `ring` set
+is an order of members in which each links to the next, and the last to the
+first. A `line` set is an order in which each links to the next. A ring or
+line link is a probed pair of `link` addresses, with both ends tagged `rdma`
+for an `rdma` set. A pair the prober marked `direct: false` goes through
+another box. A mesh counts it, and a ring or a line leaves it out. A mesh
+holds every ring, a ring holds every line, and two members on one cable are
+all three.
+
+A daemon that predates `layout` drops the key and solves the set as a mesh.
+That placement is also a valid ring and line.
 
 ```json
 {"t": "claim_ok", "name": "myjob", "generation": 3, "head_node_id": "...",
@@ -269,9 +282,13 @@ reserve the GPUs. Two groups may claim one node and compete for its devices.
 
 | Field | Value |
 | --- | --- |
-| `bind` | The address the rank binds |
+| `bind` | The address the rank binds. In a ring or a line, the port toward `next`, or toward `prev` at a line's end |
 | `iface` | Null for an address from `MENTAT_ANNOUNCE_ADDRS` |
+| `prev?`, `next?` | In a ring or a line, the member before and after this one: `node`, `host`, `addr` (the far end of the cable), and `bind` and `iface` (this end) |
 | `rtt_ms` | The round trip a probe observed |
+
+A ring or a line lists its members in order. A ring starts at its lowest
+node id.
 
 A claim on a name held for a different shape is refused. Re-solving would
 move nodes under the first claimant. Only the head solves a claim. A claim
@@ -291,6 +308,13 @@ reaches the new head, which solves the shape again.
 `pg_create` with `claim` set places among the nodes the claim chose. A
 placement group that requests more than its claim holds stays pending.
 Placing outside the claim would split ranks that agreed on one view.
+
+A claim of one `ring` or `line` set places bundle `i` on member `i`, and
+needs one bundle per member. vLLM puts rank 0 on the driver's node. So a
+ring is turned to start at the driver's node, and a line is reversed when
+the driver is on its last member. A line with the driver on an inner member
+stays pending with the reason. Each rank's spawn `env` names its neighbours
+(GUIDE.md, "Actor process"), and no rank gets `MENTAT_FABRIC_IP`.
 
 ## Agent link
 

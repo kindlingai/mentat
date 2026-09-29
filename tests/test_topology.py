@@ -503,6 +503,100 @@ def t11_the_router_forgets_a_dead_daemon():
              f"four watches, got {router_status(port)['daemons']}")
 
 
+# Four boxes cabled in a ring: (name, LAN address, port toward the previous
+# box, port toward the next box). Each cable has its own subnet.
+RING = [
+    ("r1", "192.168.5.1", "10.110.4.2", "10.110.1.1"),
+    ("r2", "192.168.5.2", "10.110.1.2", "10.110.2.1"),
+    ("r3", "192.168.5.3", "10.110.2.2", "10.110.3.1"),
+    ("r4", "192.168.5.4", "10.110.3.2", "10.110.4.1"),
+]
+
+
+def t12_a_ring_claim_places_in_cable_order():
+    """No three of the four boxes share a cable, so a four-rank group has no
+    island. A ring claim places it anyway: in cable order, starting at the
+    driver's box, with each rank told its neighbours' addresses."""
+    net = TestNet(os.path.join(tl.tempfile.mkdtemp(prefix="testnet-ring-"), "net.json"))
+    env = {**FAST, "MENTAT_TEST_NET": net.path}
+    ports = {name: tl.free_port() for name, *_ in RING}
+    fabric = []
+    for name, lan, p0, p1 in RING:
+        for addr in (lan, p0, p1):
+            net.addrs[addr] = f"127.0.0.1:{ports[name]}"
+        net.announce[lan] = f"{p0}=rdma,{p1}=rdma,{lan}=lan"
+        fabric += [p0, p1]
+    # A cable joins the two ends of one subnet, so the third octet names it.
+    for a in fabric:
+        for b in fabric:
+            if a < b and a.split(".")[2] != b.split(".")[2]:
+                net.cut.add((a, b))
+        for _, lan, _, _ in RING:
+            net.cut.add(tuple(sorted((a, lan))))
+    net.write()
+
+    daemons = {}
+    seed = f"{RING[0][1]}:{ports['r1']}"
+    for name, lan, _, _ in RING:
+        peers = [] if name == "r1" else [seed]
+        daemons[name] = Daemon(lan, peers=peers, port=ports[name], env=env).wait_up()
+    state["ring_daemons"] = daemons
+
+    def ring_head():
+        hid = daemons["r1"].status_json()["head_node_id"]
+        return next(d for d in daemons.values() if d.status_json()["node_id"] == hid)
+
+    wait_for(lambda: len(ring_head().status_json()["islands"]) == 4, 30,
+             "the four cabled pairs as islands")
+    for name, d in daemons.items():
+        d.start_agent("ring", gpus=1, container=f"c{name}", env_extra={"MENTAT_NODE_IP": ""})
+    wait_for(
+        lambda: ring_head().status_json("ring")["groups"].get("ring", {}).get("gpus_total") == 4,
+        20, "four ring agents on the head",
+    )
+
+    driver = """
+import json, os, sys
+sys.path[:0] = os.environ["PYTHONPATH"].split(os.pathsep)
+import ray
+from ray.util.placement_group import placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy as PGS
+from fake_worker import FakeWorker
+ray.init()
+pg = placement_group([{"GPU": 1.0}] * 4)
+assert ray.wait([pg.ready()], timeout=30)[0], "the ring claim never placed"
+ws = [ray.remote(FakeWorker).options(
+          num_gpus=1, scheduling_strategy=PGS(placement_group=pg,
+                                              placement_group_bundle_index=i)).remote(rank=i)
+      for i in range(4)]
+keys = ("MENTAT_NODE_IP", "MENTAT_FABRIC_LAYOUT", "MENTAT_FABRIC_PREV",
+        "MENTAT_FABRIC_NEXT", "MENTAT_FABRIC_IP")
+envs = ray.get([w.env_dump.remote() for w in ws], timeout=60)
+print(json.dumps([{k: e.get(k, "") for k in keys} for e in envs]), flush=True)
+"""
+    r = subprocess.run(
+        [sys.executable, "-c", driver],
+        env={**os.environ, "RAY_ADDRESS": daemons["r3"].address, "MENTAT_GROUP": "ring",
+             "MENTAT_CLAIM": "ring-tp4", "MENTAT_CLAIM_LAYOUT": "ring",
+             "PYTHONPATH": os.pathsep.join([tl.PYTHON_PKG, HERE])},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert r.returncode == 0, (r.stdout + r.stderr)[-1500:]
+    ranks = json.loads(r.stdout.strip().splitlines()[-1])
+
+    # Rank 0 on the driver's box, then around the ring.
+    assert [x["MENTAT_NODE_IP"] for x in ranks] == [
+        "192.168.5.3", "192.168.5.4", "192.168.5.1", "192.168.5.2"], ranks
+    # Each rank's next is the far end of the cable to the next rank.
+    assert [x["MENTAT_FABRIC_NEXT"] for x in ranks] == [
+        "10.110.3.2", "10.110.4.2", "10.110.1.2", "10.110.2.2"], ranks
+    assert [x["MENTAT_FABRIC_PREV"] for x in ranks] == [
+        "10.110.2.1", "10.110.3.1", "10.110.4.1", "10.110.1.1"], ranks
+    assert {x["MENTAT_FABRIC_LAYOUT"] for x in ranks} == {"ring"}, ranks
+    # No one address reaches every rank on a ring.
+    assert {x["MENTAT_FABRIC_IP"] for x in ranks} == {""}, ranks
+
+
 def main():
     tests = [
         t01_one_seed_reveals_the_whole_mesh,
@@ -517,6 +611,7 @@ def main():
         t09_the_router_watches_each_node_once,
         t10_the_router_follows_a_node_onto_another_address,
         t11_the_router_forgets_a_dead_daemon,
+        t12_a_ring_claim_places_in_cable_order,
     ]
     try:
         for t in tests:
@@ -525,7 +620,8 @@ def main():
     finally:
         if "router" in state:
             state["router"][0].kill()
-        for d in state.get("daemons", {}).values():
+        for d in [*state.get("daemons", {}).values(),
+                  *state.get("ring_daemons", {}).values()]:
             d.cleanup()
 
 

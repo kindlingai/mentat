@@ -144,6 +144,9 @@ pub struct BundleAssignment {
     pub agent: AgentId,
     pub node_id: NodeId,
     pub gpu_ids: Vec<u32>,
+    /// Extra variables for the rank's environment. For a ring or line
+    /// claim, they name the rank's neighbours.
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 pub struct PgInfo {

@@ -29,6 +29,35 @@ pub enum Link {
     Any,
 }
 
+/// How a set's members link to each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// Every member links to every other: one island.
+    Mesh,
+    /// Each member links to the next, and the last to the first.
+    Ring,
+    /// Each member links to the next.
+    Line,
+}
+
+impl Layout {
+    pub fn parse(s: &str) -> Result<Layout, String> {
+        match s {
+            "mesh" | "" => Ok(Layout::Mesh),
+            "ring" => Ok(Layout::Ring),
+            "line" => Ok(Layout::Line),
+            other => Err(format!(
+                "unknown layout {other:?}, expected mesh, ring or line"
+            )),
+        }
+    }
+
+    /// Whether the members come in an order that placement keeps.
+    pub fn ordered(self) -> bool {
+        self != Layout::Mesh
+    }
+}
+
 impl Link {
     pub fn parse(s: &str) -> Result<Link, String> {
         match s {
@@ -80,6 +109,7 @@ pub struct SetReq {
     /// GPUs per member, one entry per node wanted.
     pub bundles: Vec<f64>,
     pub link: Link,
+    pub layout: Layout,
     /// Pins the set to one GPU vendor. Empty lets the daemon pick one, and
     /// it still picks only one: no collective spans vendors.
     pub vendor: String,
@@ -125,6 +155,10 @@ pub struct Topology {
     /// Address pairs that replied to a probe, with the round trip observed.
     /// Undirected: a one-way link is not something to place on.
     pub links: BTreeMap<(String, String), u64>,
+    /// Linked pairs whose ARP entry named a third box. That box forwards
+    /// between the pair. A mesh counts the pair, and a ring or a line,
+    /// built from cables, leaves it out.
+    pub forwarded: BTreeSet<(String, String)>,
     /// GPUs free on each node right now.
     pub free_gpus: BTreeMap<NodeId, f64>,
     /// Hostname per node, held through for the answer to be readable.
@@ -142,11 +176,17 @@ impl Topology {
             .copied()
     }
 
-    /// The best link between two nodes meeting `link`, or None.
+    fn is_forwarded(&self, a: &str, b: &str) -> bool {
+        self.forwarded.contains(&(a.to_string(), b.to_string()))
+            || self.forwarded.contains(&(b.to_string(), a.to_string()))
+    }
+
+    /// The best link between two nodes meeting `link`, or None. With
+    /// `cable`, a forwarded pair does not count.
     ///
     /// Ranked by round trip, then by address, so a tie resolves the same way
     /// on every daemon. Ports are the node's own order otherwise.
-    fn path(&self, a: &NodeId, b: &NodeId, link: Link) -> Option<Path> {
+    fn path(&self, a: &NodeId, b: &NodeId, link: Link, cable: bool) -> Option<Path> {
         let (pa, pb) = (self.ports.get(a)?, self.ports.get(b)?);
         let mut best: Option<Path> = None;
         for x in pa {
@@ -157,6 +197,9 @@ impl Topology {
                 let Some(rtt) = self.rtt(&x.addr, &y.addr) else {
                     continue;
                 };
+                if cable && self.is_forwarded(&x.addr, &y.addr) {
+                    continue;
+                }
                 let cand = Path {
                     from: a.clone(),
                     to: b.clone(),
@@ -216,6 +259,10 @@ impl Path {
 pub struct Member {
     pub node: NodeId,
     pub bind: Port,
+    /// In a ring or a line, the links to the members before and after this
+    /// one. A line's ends have one each.
+    pub prev: Option<Path>,
+    pub next: Option<Path>,
     /// The GPU vendor this member's bundles sit on. One vendor per set,
     /// since no collective spans vendors.
     pub vendor: String,
@@ -237,14 +284,26 @@ impl Solution {
                 let members: Vec<Value> = ms
                     .iter()
                     .map(|m| {
-                        json!({
+                        let mut row = json!({
                             "node": m.node,
                             "host": name(&m.node),
                             "vendor": m.vendor,
                             "bind": m.bind.addr,
                             "iface": m.bind.iface,
                             "tags": m.bind.tags,
-                        })
+                        });
+                        for (key, p) in [("prev", &m.prev), ("next", &m.next)] {
+                            if let Some(p) = p {
+                                row[key] = json!({
+                                    "node": p.to,
+                                    "host": name(&p.to),
+                                    "addr": p.remote.addr,
+                                    "bind": p.local.addr,
+                                    "iface": p.local.iface,
+                                });
+                            }
+                        }
+                        row
                     })
                     .collect();
                 (k.clone(), Value::Array(members))
@@ -275,6 +334,12 @@ impl Solution {
 /// `any` set uses nodes in id order, which is arbitrary but identical on
 /// every daemon.
 fn candidates(t: &Topology, set: &SetReq, taken: &BTreeSet<NodeId>) -> Vec<Vec<NodeId>> {
+    if set.layout.ordered() {
+        let nodes: Vec<&NodeId> = t.free_gpus.keys().filter(|n| !taken.contains(*n)).collect();
+        let mut out = Vec::new();
+        walk(t, set, &nodes, &mut Vec::new(), &mut out);
+        return out;
+    }
     let want = set.bundles.len();
     let fits = |n: &NodeId, i: usize| {
         !taken.contains(n) && t.free_gpus.get(n).copied().unwrap_or(0.0) >= set.bundles[i]
@@ -327,6 +392,84 @@ fn candidates(t: &Topology, set: &SetReq, taken: &BTreeSet<NodeId>) -> Vec<Vec<N
             }
         }
     }
+}
+
+/// A ring or line search stops after this many answers. Each is a
+/// candidate the solver may reject for a later set, and a larger cluster
+/// has many more.
+const MAX_CHAINS: usize = 32;
+
+/// Collect into `out` the node orders for a ring or line set that extend
+/// `chain`: each member links to the next over a cable, and a ring's last
+/// member links to its first.
+///
+/// A ring starts at its lowest node id, so each ring is found once per
+/// direction. Placement rotates it to the driver's node.
+fn walk<'a>(
+    t: &Topology,
+    set: &SetReq,
+    nodes: &[&'a NodeId],
+    chain: &mut Vec<&'a NodeId>,
+    out: &mut Vec<Vec<NodeId>>,
+) {
+    let want = set.bundles.len();
+    if out.len() >= MAX_CHAINS {
+        return;
+    }
+    if chain.len() == want {
+        let closed = set.layout != Layout::Ring
+            || want < 3
+            || t.path(chain[want - 1], chain[0], set.link, true).is_some();
+        if closed {
+            out.push(chain.iter().map(|n| (*n).clone()).collect());
+        }
+        return;
+    }
+    let i = chain.len();
+    for &n in nodes {
+        if chain.contains(&n) || t.free_gpus.get(n).copied().unwrap_or(0.0) < set.bundles[i] {
+            continue;
+        }
+        if set.layout == Layout::Ring && chain.first().is_some_and(|first| n < *first) {
+            continue;
+        }
+        if let Some(last) = chain.last() {
+            if t.path(last, n, set.link, true).is_none() {
+                continue;
+            }
+        }
+        chain.push(n);
+        walk(t, set, nodes, chain, out);
+        chain.pop();
+    }
+}
+
+/// The links from member `i` to the members before and after it.
+fn neighbours(
+    t: &Topology,
+    set: &SetReq,
+    nodes: &[NodeId],
+    i: usize,
+) -> Result<(Option<Path>, Option<Path>), String> {
+    let k = nodes.len();
+    let (prev, next) = match set.layout {
+        Layout::Mesh => (None, None),
+        Layout::Ring if k > 1 => (Some((i + k - 1) % k), Some((i + 1) % k)),
+        Layout::Ring => (None, None),
+        Layout::Line => ((i > 0).then(|| i - 1), (i + 1 < k).then_some(i + 1)),
+    };
+    let link = |j: Option<usize>| {
+        j.map(|j| {
+            t.path(&nodes[i], &nodes[j], set.link, true).ok_or_else(|| {
+                format!(
+                    "{} has no cable to {} in set {:?}",
+                    nodes[i], nodes[j], set.name
+                )
+            })
+        })
+        .transpose()
+    };
+    Ok((link(prev)?, link(next)?))
 }
 
 /// The address a member binds for its own set's traffic.
@@ -391,12 +534,20 @@ pub fn solve(t: &Topology, req: &Request) -> Result<Solution, String> {
     for s in &req.sets {
         let nodes = &chosen[&s.name];
         let mut members = Vec::new();
-        for n in nodes {
-            let bind = bind_for(t, s, n, nodes)
-                .ok_or_else(|| format!("{n} has no address for set {:?}", s.name))?;
+        for (i, n) in nodes.iter().enumerate() {
+            let (prev, next) = neighbours(t, s, nodes, i)?;
+            // A ring or line member binds the port toward its next member,
+            // and a line's last member the port toward its previous one.
+            let bind = match next.as_ref().or(prev.as_ref()) {
+                Some(p) => p.local.clone(),
+                None => bind_for(t, s, n, nodes)
+                    .ok_or_else(|| format!("{n} has no address for set {:?}", s.name))?,
+            };
             members.push(Member {
                 node: n.clone(),
                 bind,
+                prev,
+                next,
                 vendor: if s.vendor.is_empty() {
                     t.vendors.get(n).cloned().unwrap_or_default()
                 } else {
@@ -454,7 +605,7 @@ fn paths_between(
         let mut best: Option<Path> = None;
         for a in from {
             for c in to {
-                if let Some(p) = t.path(a, c, b.link) {
+                if let Some(p) = t.path(a, c, b.link, false) {
                     let better = match &best {
                         None => true,
                         Some(b0) => (p.rtt_ms, &p.from, &p.to) < (b0.rtt_ms, &b0.from, &b0.to),
@@ -475,6 +626,24 @@ fn why_not(t: &Topology, req: &Request) -> String {
     let mut parts = Vec::new();
     for s in &req.sets {
         let want = s.bundles.len();
+        if s.layout.ordered() {
+            parts.push(format!(
+                "set {:?} wants a {} of {want} nodes, each cabled to the next over {} links, \
+                 and no such order of free nodes exists",
+                s.name,
+                if s.layout == Layout::Ring {
+                    "ring"
+                } else {
+                    "line"
+                },
+                if s.link == Link::Rdma {
+                    "rdma"
+                } else {
+                    "probed"
+                },
+            ));
+            continue;
+        }
         match s.link {
             Link::Rdma => {
                 let biggest = t.islands.iter().map(|i| i.nodes.len()).max().unwrap_or(0);
@@ -536,6 +705,7 @@ pub fn parse(shape: &Value) -> Result<Request, String> {
                 name,
                 bundles,
                 link: Link::parse(s["link"].as_str().unwrap_or("ip"))?,
+                layout: Layout::parse(s["layout"].as_str().unwrap_or("mesh"))?,
                 vendor: s["vendor"].as_str().unwrap_or_default().to_string(),
             })
         })
@@ -607,6 +777,9 @@ pub fn topology(st: &crate::state::State) -> Topology {
                 if r.ok {
                     t.links.insert((local.clone(), remote.clone()), r.rtt_ms);
                 }
+                if r.direct == Some(false) {
+                    t.forwarded.insert((local.clone(), remote.clone()));
+                }
             }
         }
         for (_, q) in p.last_status["peers"].as_object().into_iter().flatten() {
@@ -621,6 +794,9 @@ pub fn topology(st: &crate::state::State) -> Topology {
                             (local.clone(), remote.clone()),
                             r["rtt_ms"].as_u64().unwrap_or(0),
                         );
+                    }
+                    if r["direct"] == false {
+                        t.forwarded.insert((local.clone(), remote.clone()));
                     }
                 }
             }
@@ -758,6 +934,7 @@ mod tests {
                     name: n.to_string(),
                     bundles: vec![1.0; *k],
                     link: *l,
+                    layout: Layout::Mesh,
                     vendor: String::new(),
                 })
                 .collect(),
@@ -891,6 +1068,150 @@ mod tests {
         let t = two_pairs();
         let r = req(&[("tp0", 2, Link::Rdma)], &[("tp0", "ghost", Link::Any)]);
         assert!(solve(&t, &r).unwrap_err().contains("ghost"));
+    }
+
+    /// Four boxes with two fabric ports each, cabled in a ring, with one
+    /// subnet per cable. No three boxes share a cable, so the islands
+    /// are the four cabled pairs.
+    fn four_ring() -> Topology {
+        let mut t = Topology::default();
+        // (node, port toward the previous box, port toward the next box)
+        let spec = [
+            ("nA", "10.100.4.2", "10.100.1.1"),
+            ("nB", "10.100.1.2", "10.100.2.1"),
+            ("nC", "10.100.2.2", "10.100.3.1"),
+            ("nD", "10.100.3.2", "10.100.4.1"),
+        ];
+        for (i, (n, p0, p1)) in spec.iter().enumerate() {
+            let lan = format!("192.168.1.{}", 10 + i);
+            t.ports.insert(
+                n.to_string(),
+                vec![
+                    port(p0, "enp1s0f0np0", &["rdma"]),
+                    port(p1, "enp1s0f1np1", &["rdma"]),
+                    port(&lan, "enP7s7", &["lan"]),
+                ],
+            );
+            t.free_gpus.insert(n.to_string(), 1.0);
+            t.hosts.insert(n.to_string(), n.to_lowercase());
+        }
+        for (a, b) in [
+            ("10.100.1.1", "10.100.1.2"),
+            ("10.100.2.1", "10.100.2.2"),
+            ("10.100.3.1", "10.100.3.2"),
+            ("10.100.4.1", "10.100.4.2"),
+        ] {
+            t.links.insert((a.into(), b.into()), 0);
+        }
+        t
+    }
+
+    fn laid_out(name: &str, k: usize, layout: Layout) -> Request {
+        let mut r = req(&[(name, k, Link::Rdma)], &[]);
+        r.sets[0].layout = layout;
+        r
+    }
+
+    fn order(s: &Solution, set: &str) -> Vec<String> {
+        s.sets[set].iter().map(|m| m.node.clone()).collect()
+    }
+
+    /// The case this exists for: TP=4 over a switchless ring.
+    #[test]
+    fn a_ring_of_four_follows_the_cables() {
+        let t = four_ring();
+        let s = solve(&t, &laid_out("tp", 4, Layout::Ring)).unwrap();
+        assert_eq!(order(&s, "tp"), ["nA", "nB", "nC", "nD"]);
+        let a = &s.sets["tp"][0];
+        let next = a.next.as_ref().unwrap();
+        assert_eq!(
+            (next.local.addr.as_str(), next.remote.addr.as_str()),
+            ("10.100.1.1", "10.100.1.2")
+        );
+        let prev = a.prev.as_ref().unwrap();
+        assert_eq!(
+            (prev.to.as_str(), prev.local.addr.as_str()),
+            ("nD", "10.100.4.2")
+        );
+        // A member binds its port toward the next member.
+        assert_eq!(a.bind.addr, "10.100.1.1");
+        assert_eq!(a.bind.iface.as_deref(), Some("enp1s0f1np1"));
+    }
+
+    #[test]
+    fn a_mesh_of_four_is_refused_on_a_ring() {
+        let t = four_ring();
+        assert!(solve(&t, &laid_out("tp", 4, Layout::Mesh)).is_err());
+    }
+
+    /// A line ends at its last member, and each end has one neighbour.
+    #[test]
+    fn a_line_of_three_sits_on_the_ring() {
+        let t = four_ring();
+        let s = solve(&t, &laid_out("pp", 3, Layout::Line)).unwrap();
+        assert_eq!(order(&s, "pp"), ["nA", "nB", "nC"]);
+        let m = &s.sets["pp"];
+        assert!(m[0].prev.is_none() && m[0].next.is_some());
+        assert!(m[2].next.is_none());
+        assert_eq!(m[2].bind.addr, "10.100.2.2");
+    }
+
+    /// A triangle needs a cable between two boxes the ring keeps apart.
+    #[test]
+    fn a_ring_of_three_is_refused_on_a_ring_of_four() {
+        let t = four_ring();
+        let e = solve(&t, &laid_out("tp", 3, Layout::Ring)).unwrap_err();
+        assert!(e.contains("ring of 3"), "{e}");
+    }
+
+    /// Two boxes on one cable are a ring, a line and a mesh.
+    #[test]
+    fn one_cable_is_a_ring_of_two() {
+        let t = four_ring();
+        let s = solve(&t, &laid_out("tp", 2, Layout::Ring)).unwrap();
+        let m = &s.sets["tp"];
+        assert_eq!(order(&s, "tp"), ["nA", "nB"]);
+        assert_eq!(
+            m[0].prev.as_ref().unwrap().to,
+            m[0].next.as_ref().unwrap().to
+        );
+    }
+
+    /// B forwards between A and C. That link counts as reach, and a ring
+    /// built on it would send one rank's traffic through another box.
+    #[test]
+    fn a_forwarded_link_closes_no_ring() {
+        let mut t = four_ring();
+        t.links
+            .insert(("10.100.1.1".into(), "10.100.2.2".into()), 1);
+        t.forwarded
+            .insert(("10.100.1.1".into(), "10.100.2.2".into()));
+        assert!(solve(&t, &laid_out("tp", 3, Layout::Ring)).is_err());
+        t.forwarded.clear();
+        let s = solve(&t, &laid_out("tp", 3, Layout::Ring)).unwrap();
+        assert_eq!(order(&s, "tp"), ["nA", "nB", "nC"]);
+    }
+
+    /// A mesh holds every ring, so a ring request on a cabled pair works.
+    #[test]
+    fn a_mesh_island_holds_a_ring() {
+        let t = two_pairs();
+        let s = solve(&t, &laid_out("tp", 2, Layout::Ring)).unwrap();
+        assert_eq!(order(&s, "tp"), ["nA", "nB"]);
+    }
+
+    #[test]
+    fn layout_names() {
+        assert_eq!(Layout::parse(""), Ok(Layout::Mesh));
+        assert_eq!(Layout::parse("ring"), Ok(Layout::Ring));
+        assert_eq!(Layout::parse("line"), Ok(Layout::Line));
+        assert!(Layout::parse("star").is_err());
+        let r = parse(
+            &json!({"sets": [{"name": "tp", "bundles": 4, "link": "rdma",
+                                        "layout": "ring"}]}),
+        )
+        .unwrap();
+        assert_eq!(r.sets[0].layout, Layout::Ring);
     }
 
     #[test]

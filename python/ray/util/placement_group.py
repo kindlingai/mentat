@@ -39,6 +39,7 @@ def _claim(gpu_bundles):
     MENTAT_CLAIM_SHAPE is the shape from PROTOCOL.md. Without it the shape is
     one set covering these bundles over a fabric, which is what a
     tensor-parallel group wants and what placement did before claims existed.
+    MENTAT_CLAIM_LAYOUT (`mesh`, `ring` or `line`) sets that set's layout.
 
     Returns "" when MENTAT_CLAIM is unset, which places exactly as before.
     """
@@ -53,6 +54,9 @@ def _claim(gpu_bundles):
             raise _client.MentatError(f"mentat: MENTAT_CLAIM_SHAPE is not JSON: {e}") from None
     else:
         shape = {"sets": [{"name": "all", "bundles": gpu_bundles, "link": "rdma"}]}
+        layout = os.environ.get("MENTAT_CLAIM_LAYOUT", "").strip()
+        if layout:
+            shape["sets"][0]["layout"] = layout
     _client.get_conn().request(
         {"t": "claim", "name": name, "shape": shape}, expect="claim_ok"
     )
