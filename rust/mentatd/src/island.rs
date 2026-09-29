@@ -126,6 +126,17 @@ pub fn islands(v: &FabricView) -> (Vec<Island>, Vec<Pruned>) {
         for p in &comp {
             placed.insert(*p);
         }
+        // A rank binds one address, so a node joins through one port: the
+        // one that reaches most of the component, then the lowest address.
+        // Two ports of one node never join each other. A DGX Spark shows each
+        // QSFP port as two interfaces on one wire, and counting the node's
+        // own other interface would prune a whole cabled pair.
+        let deg: BTreeMap<(&NodeId, &String), usize> = comp
+            .iter()
+            .map(|p| (*p, comp.iter().filter(|q| v.joins(*p, **q)).count()))
+            .collect();
+        comp.sort_by_key(|p| (p.0, std::cmp::Reverse(deg[p]), p.1));
+        comp.dedup_by(|later, first| later.0 == first.0);
         // Prune to a mutually-connected set: drop the least-connected port
         // until every survivor reaches every other. Ties break on (node,
         // address) so every daemon prunes identically.
@@ -587,6 +598,32 @@ mod tests {
         let got = islands(&v).0;
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].nodes, vec!["n2", "n3"], "{got:?}");
+    }
+
+    /// A DGX Spark shows each QSFP port as two interfaces on one wire, each
+    /// numbered in its own subnet. Each interface reaches both of the far
+    /// box's, so the component has four ports. Counting a node's own other
+    /// interface against it pruned the cabled pair.
+    #[test]
+    fn two_interfaces_on_one_cable_are_one_pair() {
+        let v = view(
+            &[
+                ("nA", &["10.100.1.1", "10.100.5.1"]),
+                ("nB", &["10.100.1.2", "10.100.5.2"]),
+            ],
+            &[
+                ("10.100.1.1", "10.100.1.2"),
+                ("10.100.1.1", "10.100.5.2"),
+                ("10.100.5.1", "10.100.1.2"),
+                ("10.100.5.1", "10.100.5.2"),
+            ],
+        );
+        let (got, pruned) = islands(&v);
+        assert!(pruned.is_empty(), "{pruned:?}");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].nodes, vec!["nA", "nB"], "{got:?}");
+        assert_eq!(got[0].addr["nA"], "10.100.1.1");
+        assert_eq!(got[0].addr["nB"], "10.100.1.2");
     }
 
     /// Every member of an island holds an address, and every pair of those

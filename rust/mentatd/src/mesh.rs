@@ -1059,8 +1059,8 @@ fn probe_peer(shared: &SharedRef, me: &Prober, peer_id: &str, port: u16, remotes
                         ("reached", reached.join(",")),
                         (
                             "why",
-                            "one cable ends at one port; the far box answers ARP for \
-                             addresses on its other ports (see arp_ignore)"
+                            "the far box answered ARP for an address on another of \
+                             its ports (see arp_ignore)"
                                 .to_string(),
                         ),
                     ],
@@ -1072,8 +1072,13 @@ fn probe_peer(shared: &SharedRef, me: &Prober, peer_id: &str, port: u16, remotes
 }
 
 /// Fabric addresses whose probes reached the peer on two or more of its
-/// interfaces, with the remote addresses they reached. A peer address with
-/// no known interface counts as an interface of its own.
+/// interfaces, with the remote addresses they reached, when some answer
+/// came from a MAC other than the address's own, or from an unknown one.
+/// A peer address with no known interface counts as an interface of its
+/// own.
+///
+/// Every answer from the address's own MAC is a wire that reaches each of
+/// those interfaces, as a DGX Spark's two interfaces per QSFP port do.
 fn ambiguous_ports(
     table: &crate::state::ProbeTable,
     bind_ifaces: &BTreeMap<String, String>,
@@ -1084,11 +1089,11 @@ fn ambiguous_ports(
         if !bind_ifaces.contains_key(local) {
             continue;
         }
-        let reached: Vec<String> = row
-            .iter()
-            .filter(|(_, c)| c.ok)
-            .map(|(r, _)| r.clone())
-            .collect();
+        let ok: Vec<(&String, &PairProbe)> = row.iter().filter(|(_, c)| c.ok).collect();
+        if ok.iter().all(|(_, c)| c.direct == Some(true)) {
+            continue;
+        }
+        let reached: Vec<String> = ok.iter().map(|(r, _)| (*r).clone()).collect();
         let ifaces: BTreeSet<&str> = reached
             .iter()
             .map(|r| peer_ifaces.get(r).map(String::as_str).unwrap_or(r))
@@ -1429,6 +1434,29 @@ mod tests {
             ("192.168.1.70", "10.0.0.4", true),
         ]);
         assert!(ambiguous_ports(&t, &bind, &peer).is_empty());
+    }
+
+    /// Two answers from each address's own MAC mean the wire reaches both
+    /// interfaces, as on a DGX Spark, whose QSFP port is two interfaces.
+    #[test]
+    fn two_interfaces_on_one_wire_are_not_ambiguous() {
+        let bind = map(&[("10.100.1.1", "p1")]);
+        let peer = map(&[("10.100.1.2", "q1"), ("10.100.5.2", "q5")]);
+        let mut t = table(&[
+            ("10.100.1.1", "10.100.1.2", true),
+            ("10.100.1.1", "10.100.5.2", true),
+        ]);
+        for c in t.get_mut("10.100.1.1").unwrap().values_mut() {
+            c.direct = Some(true);
+        }
+        assert!(ambiguous_ports(&t, &bind, &peer).is_empty());
+        // One answer from another port's MAC is the far box answering ARP.
+        t.get_mut("10.100.1.1")
+            .unwrap()
+            .get_mut("10.100.5.2")
+            .unwrap()
+            .direct = Some(false);
+        assert_eq!(ambiguous_ports(&t, &bind, &peer).len(), 1);
     }
 
     /// A peer address with no known interface counts as its own.
