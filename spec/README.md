@@ -40,8 +40,8 @@ scripts/tlc -config spec/HeadDaemon.cfg spec/HeadDaemon.tla
 
 Each `Bug` constant restores a defect. `check-spec` sets each one alone and
 requires the property it broke to fail, so the spec is shown to find that
-defect. The claim constants plant a defect that its property exists to
-catch. The others shipped.
+defect. The claim constants did not ship. Each plants the defect its
+property guards against. The others shipped.
 
 | Constant | Defect | Fails | Shipped |
 | --- | --- | --- | --- |
