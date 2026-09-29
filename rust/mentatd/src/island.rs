@@ -100,7 +100,10 @@ impl FabricView {
 ///
 /// Islands of one are dropped. A lone node is not on a fabric, and placement
 /// treats a node as its own island anyway.
-pub fn islands(v: &FabricView) -> Vec<Island> {
+///
+/// Returns the islands and the ports pruned to find them.
+pub fn islands(v: &FabricView) -> (Vec<Island>, Vec<Pruned>) {
+    let mut pruned = Vec::new();
     let ports = v.ports();
     let mut out: Vec<Island> = Vec::new();
     let mut placed: HashSet<(&NodeId, &String)> = HashSet::new();
@@ -138,19 +141,12 @@ pub fn islands(v: &FabricView) -> Vec<Island> {
             if deg + 1 >= comp.len() {
                 break;
             }
-            log(
-                "island_pruned",
-                &[
-                    ("node", port.0.clone()),
-                    ("addr", port.1.clone()),
-                    ("reaches", deg.to_string()),
-                    ("of", (comp.len() - 1).to_string()),
-                    (
-                        "why",
-                        "a placement group must fit a set every member reaches".to_string(),
-                    ),
-                ],
-            );
+            pruned.push(Pruned {
+                node: port.0.clone(),
+                addr: port.1.clone(),
+                reaches: deg,
+                of: comp.len() - 1,
+            });
             comp.retain(|q| q != &port);
         }
         if comp.len() < 2 {
@@ -166,16 +162,29 @@ pub fn islands(v: &FabricView) -> Vec<Island> {
         });
     }
     out.sort_by(|a, b| a.nodes.cmp(&b.nodes));
-    out
+    (out, pruned)
+}
+
+/// A port the pruning left out: it reached `reaches` of the `of` other ports
+/// in its component.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pruned {
+    pub node: NodeId,
+    pub addr: String,
+    pub reaches: usize,
+    pub of: usize,
 }
 
 /// The islands plus the nodes that claim a fabric, which is what placement
-/// needs: one to place inside, the other to know whether to constrain.
-pub fn fabrics(v: &FabricView) -> Fabrics {
-    Fabrics {
-        islands: islands(v),
+/// needs: one to place inside, the other to know whether to constrain. Also
+/// the ports pruned on the way.
+fn fabrics(v: &FabricView) -> (Fabrics, Vec<Pruned>) {
+    let (islands, pruned) = islands(v);
+    let f = Fabrics {
+        islands,
         tagged: v.rdma.keys().cloned().collect(),
-    }
+    };
+    (f, pruned)
 }
 
 /// Read the daemon's merged view: its own tags and probes, its peers', and
@@ -285,10 +294,34 @@ fn run(shared: SharedRef) {
     // tag records that the operator meant to cable this, so silence about it is
     // how a wrong tag survives a deployment.
     let mut unverified: HashSet<String> = HashSet::new();
+    // Pruned ports, logged when pruning starts. The derivation runs every
+    // tick, and a ring prunes the same ports each time.
+    let mut pruned_now: HashSet<(NodeId, String)> = HashSet::new();
     loop {
         std::thread::sleep(tick);
         let view = gather(&shared);
-        let fresh = fabrics(&view);
+        let (fresh, pruned) = fabrics(&view);
+
+        let was = std::mem::take(&mut pruned_now);
+        for p in pruned {
+            let key = (p.node.clone(), p.addr.clone());
+            if !was.contains(&key) {
+                log(
+                    "island_pruned",
+                    &[
+                        ("node", p.node),
+                        ("addr", p.addr),
+                        ("reaches", p.reaches.to_string()),
+                        ("of", p.of.to_string()),
+                        (
+                            "why",
+                            "a placement group must fit a set every member reaches".to_string(),
+                        ),
+                    ],
+                );
+            }
+            pruned_now.insert(key);
+        }
 
         let confirmed: HashSet<&String> = view.ok_pairs.iter().flat_map(|(a, b)| [a, b]).collect();
         for (node, addrs) in &view.rdma {
@@ -402,7 +435,7 @@ mod tests {
             .ok_pairs
             .contains(&("10.100.0.1".into(), "10.100.0.2".into())));
 
-        let got = islands(&v);
+        let got = islands(&v).0;
         assert_eq!(got.len(), 1, "a fabric this daemon is not on: {got:?}");
         assert_eq!(
             got[0].addr.values().cloned().collect::<BTreeSet<_>>(),
@@ -433,7 +466,7 @@ mod tests {
         let mut v = FabricView::default();
         merge_published(&mut v, &peers);
         assert!(v.rdma.is_empty(), "a dead node offered a fabric address");
-        assert!(islands(&v).is_empty());
+        assert!(islands(&v).0.is_empty());
     }
 
     /// One of a cabled pair going down breaks the pair.
@@ -449,7 +482,7 @@ mod tests {
         let mut v = FabricView::default();
         merge_published(&mut v, &peers);
         assert_eq!(v.rdma.len(), 1, "only the live half offers an address");
-        assert!(islands(&v).is_empty(), "an island of one is not a fabric");
+        assert!(islands(&v).0.is_empty(), "an island of one is not a fabric");
     }
 
     /// A LAN address every box shares is not a fabric, tagged or not.
@@ -465,7 +498,7 @@ mod tests {
         let mut v = FabricView::default();
         merge_published(&mut v, &peers);
         assert!(v.rdma.is_empty(), "nothing tagged rdma");
-        assert!(islands(&v).is_empty());
+        assert!(islands(&v).0.is_empty());
     }
 
     #[test]
@@ -479,7 +512,7 @@ mod tests {
             ],
             &[("10.100.0.1", "10.100.0.2"), ("10.100.0.3", "10.100.0.4")],
         );
-        let got = islands(&v);
+        let got = islands(&v).0;
         assert_eq!(
             got.iter().map(|i| i.nodes.clone()).collect::<Vec<_>>(),
             vec![vec!["n1", "n2"], vec!["n3", "n4"]],
@@ -493,7 +526,7 @@ mod tests {
     #[test]
     fn a_shared_subnet_is_not_a_fabric() {
         let v = view(&[("n1", &["10.100.0.1"]), ("n2", &["10.100.0.2"])], &[]);
-        assert!(islands(&v).is_empty());
+        assert!(islands(&v).0.is_empty());
     }
 
     /// An untagged link that probes fine is the LAN. Serving rides it;
@@ -501,7 +534,7 @@ mod tests {
     #[test]
     fn an_untagged_link_makes_no_island() {
         let v = view(&[], &[("192.168.1.11", "192.168.1.12")]);
-        assert!(islands(&v).is_empty());
+        assert!(islands(&v).0.is_empty());
     }
 
     /// A half-cabled mistake: n3 reaches n1 but not n2. Announcing all
@@ -517,8 +550,11 @@ mod tests {
             ],
             &[("10.0.0.1", "10.0.0.2"), ("10.0.0.1", "10.0.0.3")],
         );
-        let got = islands(&v);
+        let (got, pruned) = islands(&v);
         assert_eq!(got.len(), 1, "{got:?}");
+        // The loop logs this port once, when pruning starts.
+        assert_eq!(pruned.len(), 1, "{pruned:?}");
+        assert_eq!((pruned[0].reaches, pruned[0].of), (1, 2), "{pruned:?}");
         // Two survivors of equal standing exist ({n1,n2} and {n1,n3}). The
         // tie-break decides which, and decides it the same way on every
         // daemon. What is asserted here is what matters: the island is
@@ -548,7 +584,7 @@ mod tests {
                 ("10.0.0.2", "10.0.1.3"),
             ],
         );
-        let got = islands(&v);
+        let got = islands(&v).0;
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].nodes, vec!["n2", "n3"], "{got:?}");
     }
@@ -570,7 +606,7 @@ mod tests {
                 ("10.100.0.1", "10.100.0.3"),
             ],
         );
-        let got = islands(&v);
+        let got = islands(&v).0;
         assert_eq!(got[0].nodes.len(), 3);
         for x in &got[0].nodes {
             for y in &got[0].nodes {
@@ -585,7 +621,7 @@ mod tests {
     /// is constrained rather than silently placed across the LAN.
     #[test]
     fn tagging_a_node_opts_it_in_before_any_probe_succeeds() {
-        let f = fabrics(&view(&[("n1", &["10.0.0.1"]), ("n2", &["10.0.0.2"])], &[]));
+        let (f, _) = fabrics(&view(&[("n1", &["10.0.0.1"]), ("n2", &["10.0.0.2"])], &[]));
         assert!(f.islands.is_empty());
         assert_eq!(f.tagged.len(), 2);
     }
@@ -598,7 +634,7 @@ mod tests {
             &[("n1", &["10.0.0.1", "10.0.1.1"]), ("n2", &["10.0.1.2"])],
             &[("10.0.1.1", "10.0.1.2")],
         );
-        let got = islands(&v);
+        let got = islands(&v).0;
         assert_eq!(got[0].addr["n1"], "10.0.1.1");
     }
 }
