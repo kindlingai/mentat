@@ -419,8 +419,8 @@ wrong cable, and `probe_port_ambiguous` logs the local address. Set
 own subnet.
 
 A DGX Spark shows each QSFP port as two interfaces on one wire. Each one
-reaches both of the far box's, and both answer ARP with their own MACs. The
-pair is one cable to mentat, and it logs no warning.
+reaches both of the far box's, and both answer ARP with their own MACs.
+mentat treats the pair as one cable.
 
 ### Islands
 
