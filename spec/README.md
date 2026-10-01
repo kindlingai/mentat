@@ -24,8 +24,11 @@ grows the state space, so `check-spec` checks each in a run of its own.
 scripts/check-spec
 ```
 
-checks the model with TLC. `scripts/tlc` fetches a pinned `tla2tools.jar`
-into `~/.cache/mentat` and needs Java 11 or later. To run TLC by hand:
+checks the models with TLC. `scripts/check-spec --list` prints the check
+names, `scripts/check-spec NAME...` runs some, and `--except NAME...` runs the
+rest. CI runs the two large liveness checks on runners of their own.
+`scripts/tlc` fetches a pinned `tla2tools.jar` into `~/.cache/mentat` and
+needs Java 11 or later. To run TLC by hand:
 
 ```
 scripts/tlc -config spec/HeadDaemon.cfg spec/HeadDaemon.tla

@@ -1,20 +1,53 @@
 #!/bin/sh
-# Model-check spec/HeadDaemon.tla against every configuration it must pass or
-# fail. Each configuration is spec/HeadDaemon.cfg with edits applied.
+# Model-check the specs in spec/ against every configuration they must pass
+# or fail. Each configuration is a spec's .cfg with edits applied.
+#
+#   scripts/check-spec                     every check
+#   scripts/check-spec NAME...             the named checks
+#   scripts/check-spec --except NAME...    every check but the named ones
+#   scripts/check-spec --list              the check names
 #
 # The fixed model must pass in both grace modes, at three devices and three
 # groups, and with claims or the restart outage switched on, at two of each.
 # Each Bug constant, set alone, restores a defect, and the property that
 # defect broke must fail. A variant that passes means the spec has lost the
 # ability to find that bug.
+#
+# Liveness costs far more than safety, so the two larger fixed models are
+# checked in two runs each, and CI runs the liveness halves as jobs of their
+# own.
 set -eu
 cd "$(dirname "$0")/.."
+
+mode=all
+case "${1:-}" in
+    --list) mode=list ;;
+    --except) mode=except; shift ;;
+    "") ;;
+    *) mode=only ;;
+esac
+names=" $* "
+seen=" "
+
+# Whether to run the check named $1.
+selected() {
+    seen="$seen$1 "
+    case "$mode" in
+        all) return 0 ;;
+        list) echo "$1"; return 1 ;;
+        only) case "$names" in *" $1 "*) return 0 ;; esac; return 1 ;;
+        except) case "$names" in *" $1 "*) return 1 ;; esac; return 0 ;;
+    esac
+}
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cp spec/HeadDaemon.tla spec/Election.tla "$work/"
 failed=0
 module=HeadDaemon
+# TLC flags for the next checks. A liveness-only run checks its temporal
+# properties once, at the end, rather than at intervals.
+flags=
 
 # check NAME EXPECT SED-ARGS...
 # EXPECT is "pass", or TLC's line for the violation. $module names
@@ -23,8 +56,12 @@ check() {
     name=$1
     expect=$2
     shift 2
-    sed "$@" "spec/$module.cfg" > "$work/$name.cfg"
-    if scripts/tlc -workers auto -metadir "$work/meta-$name" \
+    selected "$name" || return 0
+    # The empty script keeps sed from reading the file as its script when a
+    # check has no edits.
+    sed -e '' "$@" "spec/$module.cfg" > "$work/$name.cfg"
+    # shellcheck disable=SC2086 # $flags is a list of flags
+    if scripts/tlc -workers auto $flags -metadir "$work/meta-$name" \
         -config "$work/$name.cfg" "$work/$module.tla" > "$work/$name.out" 2>&1; then
         status=0
     else
@@ -43,9 +80,16 @@ check() {
 }
 
 nograce="s/GraceDeferred = TRUE/GraceDeferred = FALSE/"
+big="s/Gpus = {g1, g2}/Gpus = {g1, g2, g3}/"
+bigpgs="s/MaxPgs = 2/MaxPgs = 3/"
+safety="s/^PROPERTIES.*/PROPERTIES GraceHoldsActors SessionKeepsActors/"
+liveness="s/^PROPERTIES.*/PROPERTIES NoStall AdoptedBecomeKnown/"
+typeonly="s/^INVARIANTS.*/INVARIANTS TypeOK/"
 
-check fixed-grace pass \
-    -e 's/Gpus = {g1, g2}/Gpus = {g1, g2, g3}/' -e 's/MaxPgs = 2/MaxPgs = 3/'
+check fixed-grace-safety pass -e "$big" -e "$bigpgs" -e "$safety"
+flags="-lncheck final"
+check fixed-grace-liveness pass -e "$big" -e "$bigpgs" -e "$typeonly" -e "$liveness"
+flags=
 check fixed-nograce pass \
     -e 's/Gpus = {g1, g2}/Gpus = {g1, g2, g3}/' -e 's/MaxPgs = 2/MaxPgs = 3/' \
     -e "$nograce"
@@ -69,7 +113,11 @@ check bug-stale-timer "Action property GraceHoldsActors is violated" \
     -e 's/BugStaleTimer = FALSE/BugStaleTimer = TRUE/' \
     -e 's/^INVARIANTS.*/INVARIANTS TypeOK/' -e 's/^PROPERTIES.*/PROPERTIES GraceHoldsActors/'
 
-check fixed-claims pass -e 's/ModelClaims = FALSE/ModelClaims = TRUE/'
+check fixed-claims-safety pass -e 's/ModelClaims = FALSE/ModelClaims = TRUE/' -e "$safety"
+flags="-lncheck final"
+check fixed-claims-liveness pass -e 's/ModelClaims = FALSE/ModelClaims = TRUE/' \
+    -e "$typeonly" -e "$liveness"
+flags=
 check fixed-outage pass -e 's/ModelOutage = FALSE/ModelOutage = TRUE/'
 
 claims="s/ModelClaims = FALSE/ModelClaims = TRUE/"
@@ -96,5 +144,15 @@ module=Election
 check fixed-election pass
 check bug-no-boot-wait "Action property StableHead is violated" \
     -e 's/BugNoBootWait = FALSE/BugNoBootWait = TRUE/' -e 's/^PROPERTIES.*/PROPERTIES StableHead/'
+
+# A name that matches no check is a typo, and would otherwise skip silently.
+if [ "$mode" = only ] || [ "$mode" = except ]; then
+    for n in $names; do
+        case "$seen" in
+            *" $n "*) ;;
+            *) echo "FAIL  no check is named $n"; failed=1 ;;
+        esac
+    done
+fi
 
 exit $failed
