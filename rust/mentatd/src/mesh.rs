@@ -20,6 +20,10 @@ use crate::state::{is_loopback, now_ms_u64, FrameWriter, PairProbe, PeerInfo, Sh
 use mentat_common::logfmt::log;
 
 pub fn start(shared: SharedRef, seeds: Vec<String>, control_port: u16, http_port: u16) {
+    // A seed list shared across a fleet names the seed node itself, and that
+    // entry is skipped. Announcements bring peers without a seed.
+    let expects_peers =
+        seeds.iter().any(|s| !names_self(s, control_port)) || crate::announce::port() != 0;
     for seed in seeds {
         dial(&shared, seed, control_port, http_port, false);
     }
@@ -29,7 +33,7 @@ pub fn start(shared: SharedRef, seeds: Vec<String>, control_port: u16, http_port
     }
     {
         let shared = shared.clone();
-        std::thread::spawn(move || elector(shared));
+        std::thread::spawn(move || elector(shared, expects_peers));
     }
     {
         let shared = shared.clone();
@@ -776,8 +780,17 @@ fn staleness_sweeper(shared: SharedRef) {
 /// moves every group. A daemon with no head uses the one its live peers
 /// publish, else the lowest live id, and two settled heads that meet
 /// resolve to the lower.
-fn elector(shared: SharedRef) {
+///
+/// A booted daemon that expects peers elects nothing until a peer's status
+/// arrives or MENTAT_ELECTION_BOOT_WAIT_MS passes. Before it hears anyone its
+/// only candidate is itself, and a restarted daemon with a lower id than the
+/// live head would take the head from it once its peers heard the claim.
+/// spec/Election.tla checks this rule.
+fn elector(shared: SharedRef, expects_peers: bool) {
     let hold_down = Duration::from_millis(cfg().election_hold_down_ms);
+    let boot = Instant::now();
+    let boot_wait = Duration::from_millis(cfg().election_boot_wait_ms);
+    let mut heard = !expects_peers;
     // Tick at ~1/5th of the hold-down so short test values still commit in a
     // handful of ticks.
     let tick = Duration::from_millis((cfg().election_hold_down_ms / 5).clamp(100, 1000));
@@ -785,6 +798,22 @@ fn elector(shared: SharedRef) {
     loop {
         std::thread::sleep(tick);
         let mut st = shared.st.lock().unwrap();
+        if !heard {
+            heard = st
+                .peers
+                .values()
+                .any(|p| p.alive && !p.last_status.is_null());
+            if !heard {
+                if boot.elapsed() < boot_wait {
+                    continue;
+                }
+                log(
+                    "election_boot_wait_over",
+                    &[("after_ms", boot_wait.as_millis().to_string())],
+                );
+                heard = true;
+            }
+        }
         let candidate = head_candidate(&st);
         if candidate == st.head_node_id {
             candidate_since = None;
@@ -815,6 +844,14 @@ fn elector(shared: SharedRef) {
             shared.cv.notify_all();
         }
     }
+}
+
+/// Whether a seed address is this daemon's own control address.
+fn names_self(seed: &str, control_port: u16) -> bool {
+    let mine = crate::announce::all_local_addrs();
+    seed.to_socket_addrs().into_iter().flatten().any(|a| {
+        a.port() == control_port && (a.ip().is_loopback() || mine.contains(&a.ip().to_string()))
+    })
 }
 
 /// The head this daemon should follow, by the rule on `elector`.

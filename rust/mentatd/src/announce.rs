@@ -28,11 +28,16 @@ use mentat_common::secret;
 
 pub const DEFAULT_PORT: u16 = 6382;
 
-pub fn start(shared: SharedRef, control_port: u16, http_port: u16) {
-    let port: u16 = std::env::var("MENTAT_ANNOUNCE_PORT")
+/// MENTAT_ANNOUNCE_PORT. 0 turns announcements off.
+pub fn port() -> u16 {
+    std::env::var("MENTAT_ANNOUNCE_PORT")
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(DEFAULT_PORT);
+        .unwrap_or(DEFAULT_PORT)
+}
+
+pub fn start(shared: SharedRef, control_port: u16, http_port: u16) {
+    let port = port();
     if port == 0 {
         log(
             "announce_off",

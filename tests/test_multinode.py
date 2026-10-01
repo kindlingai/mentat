@@ -406,6 +406,41 @@ def t09_a_restarted_head_keeps_every_rank():
     assert line == "OK", f"a rank read as dead across the head restart: {line}"
 
 
+def t10_a_restarted_lower_id_does_not_take_the_head():
+    """A booted daemon elected itself before it heard a peer. One with a
+    lower id than the live head then took the head once its peers heard the
+    claim, and every group moved with it. spec/Election.tla is the model."""
+    env = {**MESH_ENV, "MENTAT_ANNOUNCE_ADDRS": "127.0.0.1=lan",
+           "MENTAT_ELECTION_BOOT_WAIT_MS": "10000"}
+    a = Daemon("127.0.0.7", env=env).wait_up()
+    b = Daemon("127.0.0.8", peers=[f"127.0.0.1:{a.port}"], env=env).wait_up()
+    state.update(ea=a, eb=b)
+    a_id, b_id = a.status_json()["node_id"], b.status_json()["node_id"]
+    assert a_id < b_id
+    wait_for(lambda: b.status_json()["head_node_id"] == a_id, 20, "a to lead")
+
+    a.kill()
+    wait_for(lambda: b.status_json()["head_node_id"] == b_id, 20, "b to take over")
+
+    # a comes back on a new port, so b cannot dial it, and its only seed is a
+    # closed proxy to b. It hears nobody for longer than the hold-down.
+    proxy = tl.TcpProxy(b.address)
+    state["eproxy"] = proxy
+    proxy.pause()
+    a2 = Daemon("127.0.0.7", peers=[proxy.address], env=env).wait_up()
+    state["ea"] = a2
+    time.sleep(4)
+    assert a2.status_json()["head_node_id"] != a2.status_json()["node_id"], \
+        "a elected itself before hearing a peer"
+
+    proxy.resume()
+    wait_for(lambda: a2.status_json()["head_node_id"] == b_id, 20, "a to follow b")
+    deadline = time.time() + 4
+    while time.time() < deadline:
+        assert b.status_json()["head_node_id"] == b_id, "the head moved to a"
+        time.sleep(0.3)
+
+
 def main():
     tests = [
         t01_workers_first_then_head,
@@ -418,6 +453,7 @@ def main():
         t07_a_lost_peer_is_marked_then_forgotten,
         t08_the_snapshot_states_the_stream_position,
         t09_a_restarted_head_keeps_every_rank,
+        t10_a_restarted_lower_id_does_not_take_the_head,
     ]
     try:
         for t in tests:
@@ -428,7 +464,9 @@ def main():
             state.get("ray") and state["ray"].shutdown()
         except Exception:
             pass
-        for k in ("d1", "d2", "d3", "rh", "rw"):
+        if "eproxy" in state:
+            state["eproxy"].close()
+        for k in ("d1", "d2", "d3", "rh", "rw", "ea", "eb"):
             if k in state:
                 state[k].cleanup()
 

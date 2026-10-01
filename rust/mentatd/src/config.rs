@@ -50,6 +50,11 @@ pub struct Cfg {
     /// must be stable before the designation changes, so a flapping link
     /// cannot thrash head_change events.
     pub election_hold_down_ms: u64,
+    /// MENTAT_ELECTION_BOOT_WAIT_MS, default 20_000. How long a booted
+    /// daemon that expects peers waits to hear one before it may elect
+    /// itself. A restarted daemon that elected itself unheard could take the
+    /// head from a live one. Every group moves with the head.
+    pub election_boot_wait_ms: u64,
     /// MENTAT_PROBE_INTERVAL_MS, default 15_000. How often each daemon
     /// re-probes reachability to every live peer, one probe per (own
     /// address x peer address) pair. Slow on purpose: the table replies
@@ -160,6 +165,7 @@ pub fn cfg() -> &'static Cfg {
         peer_stale_after_ms: env_ms("MENTAT_PEER_STALE_AFTER_MS", 30_000),
         peer_dead_after_ms: env_ms("MENTAT_PEER_DEAD_AFTER_MS", 60_000),
         election_hold_down_ms: env_ms("MENTAT_ELECTION_HOLD_DOWN_MS", 5_000),
+        election_boot_wait_ms: env_ms("MENTAT_ELECTION_BOOT_WAIT_MS", 20_000),
         probe_interval_ms: env_ms("MENTAT_PROBE_INTERVAL_MS", 15_000),
         probe_timeout_ms: env_ms("MENTAT_PROBE_TIMEOUT_MS", 2_000),
         island_placement: env_on("MENTAT_ISLAND_PLACEMENT", true),

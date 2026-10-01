@@ -1,5 +1,14 @@
 # spec
 
+`Election.tla` models head election across daemons: which head each daemon
+follows, and how a daemon that boots or crashes changes that. Its
+`StableHead` property says no daemon leaves the settled head while that head
+is up, and `Converges` says the live daemons come to follow one live head.
+`BugNoBootWait` restores the defect where a restarted daemon elected itself
+before hearing a peer, and one with a lower id took the head. The model
+leaves out partitions and assumes a daemon in the mesh reaches every live
+daemon within the hold-down.
+
 `HeadDaemon.tla` is a TLA+ model of the head daemon's placement state for
 one group: driver sessions, the session reap and its grace, placement
 groups, actors, claims, and a daemon restart that adopts the actors still

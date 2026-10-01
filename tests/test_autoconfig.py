@@ -137,9 +137,11 @@ def t01_a_daemon_with_no_flags_names_itself():
     """`mentatd daemon` with no arguments settles on an identity and a head.
 
     MENTAT_NODE_IP is what a deployment would otherwise have to set, so the
-    route to the world has to stand in for it.
+    route to the world has to stand in for it. Announcements are on, so the
+    daemon expects peers and waits out MENTAT_ELECTION_BOOT_WAIT_MS before it
+    elects itself.
     """
-    deadline = time.time() + 20
+    deadline = time.time() + 40
     while time.time() < deadline:
         snap = status()
         if snap["head_node_id"]:
@@ -149,8 +151,10 @@ def t01_a_daemon_with_no_flags_names_itself():
         raise TimeoutError(f"no head after the hold-down: {status()}")
     assert snap["node_ip"], snap
     assert snap["node_id"], snap
-    # A lone daemon elects itself, so the identity it derived is the head.
+    # A lone daemon elects itself once the boot wait runs out, so the
+    # identity it derived is the head.
     assert snap["head_node_id"] == snap["node_id"], snap
+    assert any("event=election_boot_wait_over" in l for l in state["daemon_log"]())
     assert snap["control_port"] == CONTROL, snap
     # Derived from the route to the world, which is what MENTAT_NODE_IP
     # would otherwise have to supply.

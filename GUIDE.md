@@ -650,6 +650,15 @@ How long a head candidate must stay best before `head_change` fires. A
 higher value stops a stream of `head_change` events. Head changes then lag
 by as much.
 
+- `MENTAT_ELECTION_BOOT_WAIT_MS` (default 20000)
+
+How long a booted daemon that expects peers waits to hear one before it may
+elect itself. A daemon expects peers when it has a seed other than itself or
+announcements are on. A restarted daemon that elected itself before hearing
+its peers could take the head from a live one, and every group would move.
+A daemon alone on the network becomes head once the wait runs out and logs
+`election_boot_wait_over`. spec/Election.tla models the rule.
+
 - `MENTAT_SLOW_CALL_WARN_MS` (default 15000)
 
 A call other than `run()` pending longer than this logs `call_pending_long`

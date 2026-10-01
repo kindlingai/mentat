@@ -12,18 +12,20 @@ cd "$(dirname "$0")/.."
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-cp spec/HeadDaemon.tla "$work/"
+cp spec/HeadDaemon.tla spec/Election.tla "$work/"
 failed=0
+module=HeadDaemon
 
 # check NAME EXPECT SED-ARGS...
-# EXPECT is "pass", or the line TLC prints for the violation.
+# EXPECT is "pass", or TLC's line for the violation. $module names
+# the spec and the config the edits apply to.
 check() {
     name=$1
     expect=$2
     shift 2
-    sed "$@" spec/HeadDaemon.cfg > "$work/$name.cfg"
+    sed "$@" "spec/$module.cfg" > "$work/$name.cfg"
     if scripts/tlc -workers auto -metadir "$work/meta-$name" \
-        -config "$work/$name.cfg" "$work/HeadDaemon.tla" > "$work/$name.out" 2>&1; then
+        -config "$work/$name.cfg" "$work/$module.tla" > "$work/$name.out" 2>&1; then
         status=0
     else
         status=$?
@@ -89,5 +91,10 @@ check bug-no-redial "Invariant NoFalseDeath is violated" \
 check bug-unknown-ref-ready "Invariant NoFalseDeath is violated" \
     -e "$outage" -e 's/BugUnknownRefReady = FALSE/BugUnknownRefReady = TRUE/' \
     -e "$(only NoFalseDeath)" -e '/^PROPERTIES/d'
+
+module=Election
+check fixed-election pass
+check bug-no-boot-wait "Action property StableHead is violated" \
+    -e 's/BugNoBootWait = FALSE/BugNoBootWait = TRUE/' -e 's/^PROPERTIES.*/PROPERTIES StableHead/'
 
 exit $failed
