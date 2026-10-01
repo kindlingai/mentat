@@ -46,7 +46,7 @@ cp spec/HeadDaemon.tla spec/Election.tla "$work/"
 failed=0
 module=HeadDaemon
 # TLC flags for the next checks. A liveness-only run checks its temporal
-# properties once, at the end, rather than at intervals.
+# properties once, at the end.
 flags=
 
 # check NAME EXPECT SED-ARGS...
@@ -145,7 +145,7 @@ check fixed-election pass
 check bug-no-boot-wait "Action property StableHead is violated" \
     -e 's/BugNoBootWait = FALSE/BugNoBootWait = TRUE/' -e 's/^PROPERTIES.*/PROPERTIES StableHead/'
 
-# A name that matches no check is a typo, and would otherwise skip silently.
+# Every name given must match a check, so a typo fails the run.
 if [ "$mode" = only ] || [ "$mode" = except ]; then
     for n in $names; do
         case "$seen" in
