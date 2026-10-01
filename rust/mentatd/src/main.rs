@@ -198,7 +198,14 @@ fn main() {
             head_json,
             peers,
         }) => {
-            let node_ip = node_ip.unwrap_or_else(daemon::default_node_ip);
+            let node_ip = match node_ip.map(Ok).unwrap_or_else(daemon::default_node_ip) {
+                Ok(ip) => ip,
+                Err(why) => {
+                    mentat_common::logfmt::log("daemon_no_node_ip", &[("error", why.clone())]);
+                    eprintln!("mentatd: {why}");
+                    std::process::exit(1);
+                }
+            };
             let peers = if peers.is_empty() {
                 std::env::var("MENTAT_PEERS")
                     .unwrap_or_default()

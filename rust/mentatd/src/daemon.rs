@@ -29,22 +29,45 @@ pub struct DaemonOpts {
     pub peers: Vec<String>,
 }
 
-/// This node's cluster identity.
+/// This node's cluster identity: MENTAT_NODE_IP, else the source address of
+/// the default route.
 ///
 /// A set-but-empty MENTAT_NODE_IP reads as unset. `${MENTAT_NODE_IP:-}` in a
 /// compose file sets the variable to nothing, and reading that literally gave
 /// every daemon deployed from the shipped file the same identity, since a
 /// node id is the hash of this string and they all hashed "mentat:". Peers
 /// skip a peer bearing their own id, so such a fleet never meshed.
-pub fn default_node_ip() -> String {
-    if let Ok(ip) = std::env::var("MENTAT_NODE_IP") {
+///
+/// Without a default route, or with one that leaves from loopback, this is
+/// an error. A loopback identity is unreachable from every other node, and a
+/// fleet of them would share one node id. A dev box sets 127.0.0.1 itself.
+pub fn default_node_ip() -> Result<String, String> {
+    node_ip_from(
+        std::env::var("MENTAT_NODE_IP").ok(),
+        local_ip_toward("8.8.8.8:53"),
+    )
+}
+
+/// `default_node_ip` given the variable and the default route's source
+/// address.
+fn node_ip_from(env: Option<String>, route: Option<String>) -> Result<String, String> {
+    if let Some(ip) = env {
         let ip = ip.trim();
         if !ip.is_empty() {
-            return ip.to_string();
+            return Ok(ip.to_string());
         }
     }
-    // The address we'd use to reach the world. Loopback on dev boxes.
-    local_ip_toward("8.8.8.8:53").unwrap_or_else(|| "127.0.0.1".to_string())
+    match route {
+        Some(ip) if !crate::state::is_loopback(&ip) => Ok(ip),
+        found => Err(format!(
+            "no default route to take this node's address from{}. Set MENTAT_NODE_IP \
+             or --node-ip to the address other nodes reach this one on, or to \
+             127.0.0.1 for a daemon on its own",
+            found
+                .map(|ip| format!(" (it leaves from {ip})"))
+                .unwrap_or_default()
+        )),
+    }
 }
 
 pub fn run(opts: DaemonOpts) -> std::io::Result<()> {
@@ -3066,9 +3089,31 @@ fn agent_conn(
 
 #[cfg(test)]
 mod tests {
-    use super::{claim, claim_order, fit_ordered, misfiled, orphans_of, sweep_history, RankOrder};
+    use super::{
+        claim, claim_order, fit_ordered, misfiled, node_ip_from, orphans_of, sweep_history,
+        RankOrder,
+    };
     use crate::state::{ActorInfo, ActorState, ClientInfo, State};
     use serde_json::{json, Value};
+
+    /// A box with no default route took 127.0.0.1 and booted. Its peers could
+    /// not reach it, and every such box hashed to one node id.
+    #[test]
+    fn a_daemon_without_a_route_needs_an_address() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(node_ip_from(s("10.0.0.5"), None), Ok("10.0.0.5".into()));
+        assert_eq!(
+            node_ip_from(s(" "), s("192.168.1.9")),
+            Ok("192.168.1.9".into())
+        );
+        assert_eq!(node_ip_from(s("127.0.0.1"), None), Ok("127.0.0.1".into()));
+        assert!(node_ip_from(None, None)
+            .unwrap_err()
+            .contains("MENTAT_NODE_IP"));
+        assert!(node_ip_from(s(""), s("127.0.0.1"))
+            .unwrap_err()
+            .contains("127.0.0.1"));
+    }
 
     /// A second holder spells the shape its own way and joins the claim it
     /// already holds. Going through `claim` covers the comparison the

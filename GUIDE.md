@@ -508,8 +508,10 @@ This node's cluster identity. On a multi-homed node it must be the address
 the driver sees itself on, the same one the model containers use. The
 default is the route to the internet, which on a multi-homed node is usually
 the wrong interface and breaks the match between driver and node. Set but
-empty reads as unset. An identity still empty after that stops the daemon.
-Every such daemon would share one node id.
+empty reads as unset. A box with no default route, or one whose route
+leaves from loopback, stops the daemon at boot with `daemon_no_node_ip`:
+other nodes could not reach a loopback identity, and every such daemon would
+share one node id. A daemon run on its own sets `127.0.0.1` itself.
 
 - `MENTAT_PEERS` (default: empty)
 
