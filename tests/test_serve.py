@@ -914,7 +914,7 @@ def t13_an_mcp_only_group_is_listed_under_mcp():
     # page lists it with the MCP servers and leaves it out of the models.
     mX = FakeModel("model-x", "tool_x")
     state["mcp_only"] = mX
-    cluster.start_agent("gx", container="cx", env_extra={
+    state["gx_agent"] = cluster.start_agent("gx", container="cx", env_extra={
         "MENTAT_MCP_API": f"http://127.0.0.1:{mX.port}/mcp",
     })
 
@@ -926,6 +926,23 @@ def t13_an_mcp_only_group_is_listed_under_mcp():
     assert "tool_x" in mcp_rows()["gx"], mcp_rows()
     models = serve_get("/stats.json")[1]["models"]
     assert not [m for m in models if m["group"] == "gx"], models
+
+
+def t14_an_mcp_only_group_stays_listed_while_its_agent_lives():
+    """Retirement asked whether a group's OpenAI endpoint served. A group
+    that announces only an MCP server never does, so the router dropped it
+    MODEL_TTL_S after first seeing it, while its agent was alive."""
+    port = start_router(cluster.http_port, MODEL_TTL_S="2")
+    wait_until(lambda: "gx" in groups_at(port), 20, "the router never listed gx")
+    holds_until = time.time() + 7
+    while time.time() < holds_until:
+        assert "gx" in groups_at(port), "gx retired while its agent was alive"
+        time.sleep(0.5)
+
+    # A gone agent leaves the daemon's row behind. The clock runs from then.
+    state["gx_agent"].kill()
+    wait_until(lambda: "gx" not in groups_at(port), 20,
+               "gx never retired after its agent died")
 
 
 def main():
@@ -949,6 +966,7 @@ def main():
         t11_a_registration_with_no_actors_is_served,
         t12_an_unservable_group_is_retired_then_comes_back,
         t13_an_mcp_only_group_is_listed_under_mcp,
+        t14_an_mcp_only_group_stays_listed_while_its_agent_lives,
     ]
     try:
         for t in tests:

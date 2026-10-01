@@ -84,7 +84,9 @@ A daemon drops the agent and actor rows of a gone container after its
 `MENTAT_HISTORY_KEEP_MS`. A group with no rows left is gone from its
 snapshots. The router also keeps its own clock per group. The clock starts
 when the group is first seen, and every round the group can serve resets it.
-After `MODEL_TTL_S` without such a round the group is retired. It leaves
+A group with an OpenAI endpoint can serve when its probe admits it. A group
+that announces only an MCP server can serve while one of its agents is
+alive. After `MODEL_TTL_S` without such a round the group is retired. It leaves
 `/v1/models`, `/status.json`, the status page and the routes. `group_retired`
 is logged once, with the last reason the group could not serve.
 

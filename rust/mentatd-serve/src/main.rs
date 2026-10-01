@@ -708,8 +708,8 @@ fn age_groups(shared: &Shared, announced: &BTreeMap<String, GroupEntry>) {
             let l = live
                 .entry(name.clone())
                 .or_insert_with(|| Liveness::new(now));
-            match health_of(shared, e) {
-                Ok(_) => {
+            match in_service(shared, e) {
+                Ok(()) => {
                     l.round(now, true, shared.cfg.model_ttl);
                 }
                 Err(why) => {
@@ -732,6 +732,20 @@ fn age_groups(shared: &Shared, announced: &BTreeMap<String, GroupEntry>) {
             ],
         );
     }
+}
+
+/// Whether a group still does what it announces, for retirement. A group
+/// with an OpenAI endpoint serves when `health_of` admits it. A group that
+/// announces an MCP server and no engine has no model to probe, so it serves
+/// while an agent of it is alive.
+fn in_service(shared: &Shared, e: &GroupEntry) -> Result<(), String> {
+    if e.openai.is_none() && e.mcp.is_some() {
+        return match e.agents_alive {
+            0 => Err("no alive agent announces its MCP server".into()),
+            _ => Ok(()),
+        };
+    }
+    health_of(shared, e).map(|_| ())
 }
 
 /// Ok(model names) when the group may serve traffic; Err(why) otherwise.
