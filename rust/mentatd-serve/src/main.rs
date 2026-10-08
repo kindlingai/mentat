@@ -17,6 +17,7 @@
 //! is admitted only while it has a running actor and its announced endpoint
 //! replies to a probe.
 
+mod graph;
 mod mcp;
 mod net;
 mod proxy;

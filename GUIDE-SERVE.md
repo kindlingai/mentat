@@ -213,7 +213,7 @@ list covers addresses the router derived for itself.
 | `POST /mcp` | The merged MCP endpoint. See "The MCP merge" |
 | any other `POST` | Forwarded by the request's `model`, for root-level engine endpoints such as `/tokenize` |
 | `GET /`, `/healthz`, `/status.json` | Route table, per-group health and endpoints, `uptime_s`, `verify` |
-| `GET /stats.json` | Per-model engine and router counters and each group's MCP tools, for the status page |
+| `GET /stats.json` | Per-model engine and router counters, each model's nodes and each group's MCP tools, for the status page |
 
 `GET /` with an `Accept` header that requests HTML, as from a browser,
 returns the status page.
@@ -237,7 +237,8 @@ The engine publishes queue depth, KV usage, token totals and latency
 histograms on `/metrics`, so `running`, `waiting`, `kv`, the token counts
 and the mean TTFT, queue and inter-token columns come from the engine
 serving that model. The router adds `proxied`, the number of requests in
-flight for that model.
+flight for that model. `nodes` lists the nodes with an alive agent of the
+group, and `(api)` marks the one that announces the OpenAI endpoint.
 
 A click on a model lists those requests one per row: body size, time
 waiting with no first byte, time to first byte once it arrives, and bytes
@@ -300,6 +301,20 @@ arguments. `tools/list` replies are cached per group for `TOOLS_TTL_S`.
 
 The merge skips the admission gate. A status server matters most while its
 engine is loading or stuck, which is when the gate would exclude it.
+
+The router serves four tools of its own, read-only, from the daemon
+snapshots it polls. A group tool with one of these names is dropped and
+logged as `mcp_tool_dropped`.
+
+| Tool | Returns |
+| --- | --- |
+| `serve_status` | What the router can route: watched daemons, each group's health and endpoints, and the model table |
+| `mentat_nodes` | Every node: its addresses with interface, tags and MAC, whether it is head, and its agents with their group, GPUs and metadata. `heads_reported` lists more than one head when daemons disagree |
+| `mentat_links` | Every probed address pair that answered, with the round trip, whether both ends are `rdma` ports, and `direct`, with `via` naming the box that forwards a pair. `failed: true` adds the pairs that failed. Also the fabric islands |
+| `mentat_group` | One group, named by `group`: its agents, actors, placement groups and claims, with node names in place of node ids |
+
+A node's name is its hostname. Two nodes with one hostname each get their
+address beside it.
 
 The native tool `serve_status` reports the watched daemons, each group's
 health and endpoints, and the model table. That name is reserved. A group

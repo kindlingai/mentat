@@ -489,6 +489,29 @@ def t10_the_router_follows_a_node_onto_another_address():
         net.write()
 
 
+def t10b_the_router_reports_the_fabric_links():
+    """mentat_links: the cabled pair's fabric addresses reach each other over
+    rdma, and a fabric port reaches no other box's."""
+    _, port = state["router"]
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/mcp",
+        data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": "mentat_links", "arguments": {}}}).encode(),
+        headers={"Content-Type": "application/json"})
+
+    def links():
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(json.load(r)["result"]["content"][0]["text"])["links"]
+
+    pair = {fabric_addr("n70"), fabric_addr("n77")}
+    wait_for(lambda: any({l["from_addr"], l["to_addr"]} == pair and l["rdma"] for l in links()),
+             30, "the router to report the n70-n77 fabric link")
+    fabric = {f for _, f, _ in BOXES.values() if f}
+    for l in links():
+        if l["from_addr"] in fabric and l["to_addr"] in fabric:
+            assert cabled(l["from_addr"], l["to_addr"]), l
+
+
 def t11_the_router_forgets_a_dead_daemon():
     daemons, ports = state["daemons"], state["ports"]
     _, port = state["router"]
@@ -610,6 +633,7 @@ def main():
         t08_dead_agents_and_removed_groups_age_out,
         t09_the_router_watches_each_node_once,
         t10_the_router_follows_a_node_onto_another_address,
+        t10b_the_router_reports_the_fabric_links,
         t11_the_router_forgets_a_dead_daemon,
         t12_a_ring_claim_places_in_cable_order,
     ]

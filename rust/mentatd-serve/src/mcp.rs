@@ -24,9 +24,70 @@ use mentat_common::logfmt::log;
 /// leading underscores keep it clear of the tools' own parameter names.
 const GROUP_ARG: &str = "__group";
 
-/// The one tool this server serves itself. A group tool of the same name
-/// would be unreachable, so the merge drops it and logs.
-const NATIVE: &str = "serve_status";
+/// The tools this server serves itself. A group tool of the same name would
+/// be unreachable, so the merge drops it and logs.
+const NATIVE: [&str; 4] = [
+    "serve_status",
+    "mentat_nodes",
+    "mentat_links",
+    "mentat_group",
+];
+
+/// The server's own tools, as `tools/list` gives them.
+fn native_tools() -> Vec<Value> {
+    let none = json!({"type": "object", "properties": {}});
+    vec![
+        json!({
+            "name": "serve_status",
+            "description": "What mentatd-serve can route right now: watched daemons, \
+                            each group's health and endpoints, and the model table.",
+            "inputSchema": none,
+        }),
+        json!({
+            "name": "mentat_nodes",
+            "description": "Every node in the mentat cluster: its addresses with \
+                            interface, tags and MAC, whether it is the head, and the \
+                            agents on it with their group, GPUs and metadata (kernel, \
+                            drivers, RoCE GIDs). heads_reported lists more than one head \
+                            when daemons disagree.",
+            "inputSchema": none,
+        }),
+        json!({
+            "name": "mentat_links",
+            "description": "The address pairs the daemons probed, and the fabric islands. \
+                            Each link gives the round trip, whether both ends are rdma \
+                            fabric ports, and `direct`: true when the far end answered \
+                            on the cable, false when another box (`via`) forwards.",
+            "inputSchema": {"type": "object", "properties": {
+                "failed": {"type": "boolean",
+                           "description": "Also list the pairs that failed, with the error."}}},
+        }),
+        json!({
+            "name": "mentat_group",
+            "description": "One group: its agents, actors (state, node, pid, GPUs), \
+                            placement groups with any pending reason, and claims.",
+            "inputSchema": {"type": "object", "required": ["group"], "properties": {
+                "group": {"type": "string", "description": "The group's name."}}},
+        }),
+    ]
+}
+
+/// Run one of the server's own tools, or None for a name it does not serve.
+fn call_native(shared: &Shared, name: &str, args: &Value) -> Option<Result<Value, String>> {
+    Some(match name {
+        "serve_status" => Ok(status_view(shared)),
+        "mentat_nodes" => Ok(crate::graph::nodes(shared)),
+        "mentat_links" => Ok(crate::graph::links(
+            shared,
+            args["failed"].as_bool().unwrap_or(false),
+        )),
+        "mentat_group" => match args["group"].as_str() {
+            Some(g) => crate::graph::group(shared, g),
+            None => Err("mentat_group needs a `group`".into()),
+        },
+        _ => return None,
+    })
+}
 
 /// Tool calls are small JSON. A bigger body is a client bug.
 const MAX_BODY: usize = 16 * 1024 * 1024;
@@ -126,7 +187,7 @@ async fn merge(shared: &Arc<Shared>) -> BTreeMap<String, Merged> {
             let Some(name) = t["name"].as_str() else {
                 continue;
             };
-            if name == NATIVE {
+            if NATIVE.contains(&name) {
                 log(
                     "mcp_tool_dropped",
                     &[
@@ -159,12 +220,7 @@ async fn merge(shared: &Arc<Shared>) -> BTreeMap<String, Merged> {
 }
 
 async fn tool_list(shared: &Arc<Shared>) -> Vec<Value> {
-    let mut out = vec![json!({
-        "name": NATIVE,
-        "description": "What mentatd-serve can route right now: watched daemons, \
-                        each group's health and endpoints, and the model table.",
-        "inputSchema": {"type": "object", "properties": {}},
-    })];
+    let mut out = native_tools();
     for (name, m) in merge(shared).await {
         out.push(json!({
             "name": name,
@@ -260,6 +316,7 @@ async fn group_tools(shared: &Arc<Shared>, group: &str, url: &str) -> Vec<Value>
 ///
 /// `tools` is null until a list has answered. `error` is the last failure.
 pub fn page_view(shared: &Arc<Shared>) -> Vec<Value> {
+    let placed = crate::graph::group_nodes(shared);
     let mut out = Vec::new();
     for e in group_table(shared).values() {
         let Some(url) = e.mcp.as_ref().and_then(|m| m.best()) else {
@@ -294,7 +351,8 @@ pub fn page_view(shared: &Arc<Shared>) -> Vec<Value> {
             Some((_, Err(err))) => (Value::Null, json!(err)),
             None => (Value::Null, Value::Null),
         };
-        out.push(json!({"group": e.group, "tools": tools, "error": error}));
+        out.push(json!({"group": e.group, "nodes": placed.get(&e.group),
+                        "tools": tools, "error": error}));
     }
     out
 }
@@ -308,12 +366,16 @@ fn tool_err(rid: &Value, msg: String) -> Value {
 
 async fn call(shared: &Arc<Shared>, rid: Value, params: Value) -> Value {
     let name = params["name"].as_str().unwrap_or("");
-    if name == NATIVE {
-        let text =
-            serde_json::to_string_pretty(&status_view(shared)).unwrap_or_else(|e| e.to_string());
-        return json!({"jsonrpc": "2.0", "id": rid,
-                      "result": {"content": [{"type": "text", "text": text}],
-                                 "isError": false}});
+    if let Some(r) = call_native(shared, name, &params["arguments"]) {
+        return match r {
+            Ok(v) => {
+                let text = serde_json::to_string_pretty(&v).unwrap_or_else(|e| e.to_string());
+                json!({"jsonrpc": "2.0", "id": rid,
+                       "result": {"content": [{"type": "text", "text": text}],
+                                  "isError": false}})
+            }
+            Err(e) => tool_err(&rid, e),
+        };
     }
     // The same merge the listing was built from, so a name that was listed
     // resolves the same way here. The per-group lists are cached, so this
@@ -324,7 +386,7 @@ async fn call(shared: &Arc<Shared>, rid: Value, params: Value) -> Value {
             &rid,
             format!(
                 "no tool {name:?}. Tools right now: {}",
-                list_or_none(std::iter::once(NATIVE).chain(merged.keys().map(String::as_str)))
+                list_or_none(NATIVE.into_iter().chain(merged.keys().map(String::as_str)))
             ),
         );
     };

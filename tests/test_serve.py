@@ -945,6 +945,44 @@ def t14_an_mcp_only_group_stays_listed_while_its_agent_lives():
                "gx never retired after its agent died")
 
 
+def t15_the_router_serves_the_cluster_graph():
+    """The router's own MCP tools: nodes with their agents, one group's
+    placement, and the status page naming each model's nodes."""
+    def call(name, args=None):
+        r = mcp({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                 "params": {"name": name, "arguments": args or {}}})["result"]
+        return r["isError"], r["content"][0]["text"]
+
+    listed = {t["name"] for t in mcp({"jsonrpc": "2.0", "id": 1,
+                                      "method": "tools/list"})["result"]["tools"]}
+    assert {"mentat_nodes", "mentat_links", "mentat_group"} <= listed, listed
+
+    err, text = call("mentat_nodes")
+    assert not err, text
+    nodes = json.loads(text)
+    head = [n for n in nodes["nodes"] if n["head"]]
+    assert len(head) == 1 and nodes["head"] == head[0]["node"], nodes
+    groups = {a["group"] for a in head[0]["agents"]}
+    assert {"ga", "gb"} <= groups, head[0]["agents"]
+
+    err, text = call("mentat_group", {"group": "ga"})
+    assert not err, text
+    ga = json.loads(text)
+    assert ga["agents"] and all(a["node"] == head[0]["node"] for a in ga["agents"].values()), ga
+    # t07 killed ga's actor. The actor's row stays, with the node it ran on.
+    assert ga["actors"] and all(a["node"] for a in ga["actors"].values()), ga["actors"]
+
+    err, text = call("mentat_group", {"group": "nosuch"})
+    assert err and "ga" in text, text
+    err, text = call("mentat_links")
+    assert not err and "links" in json.loads(text), text
+
+    # The row names the node that announces the API. Earlier tests closed
+    # ga's gate, so its row is the group's own.
+    rows = [m for m in serve_get("/stats.json")[1]["models"] if m["group"] == "ga"]
+    assert rows and rows[0]["nodes"] == [head[0]["node"] + " (api)"], rows
+
+
 def main():
     tests = [
         t01_announcement_reaches_status,
@@ -967,6 +1005,7 @@ def main():
         t12_an_unservable_group_is_retired_then_comes_back,
         t13_an_mcp_only_group_is_listed_under_mcp,
         t14_an_mcp_only_group_stays_listed_while_its_agent_lives,
+        t15_the_router_serves_the_cluster_graph,
     ]
     try:
         for t in tests:

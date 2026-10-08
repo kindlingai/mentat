@@ -303,7 +303,9 @@ pub async fn stats(shared: &Arc<Shared>) -> Value {
         *counts.entry(r.model.clone()).or_default() += 1;
     }
 
+    let placed = crate::graph::group_nodes(shared);
     for e in group_table(shared).values() {
+        let nodes = placed.get(&e.group).cloned().unwrap_or_default();
         // A group that announces an MCP server and no engine serves no
         // model. The MCP table lists it.
         if e.openai.is_none() && e.mcp.is_some() {
@@ -324,6 +326,7 @@ pub async fn stats(shared: &Arc<Shared>) -> Value {
             rows.push(json!({
                 "model": name,
                 "group": e.group,
+                "nodes": nodes,
                 "provider": e.provider,
                 "healthy": health.is_ok(),
                 "why_not": health.as_ref().err(),
@@ -346,6 +349,7 @@ pub async fn stats(shared: &Arc<Shared>) -> Value {
             rows.push(json!({
                 "model": e.group,
                 "group": e.group,
+                "nodes": nodes,
                 "provider": e.provider,
                 "healthy": false,
                 "why_not": health.as_ref().err(),
@@ -415,6 +419,7 @@ tbody tr[aria-selected=true] { font-weight: bold }
 a { color: inherit }
 .dead { opacity: .6 }
 #mcp th, #mcp td { text-align: left }
+#models td:nth-child(-n+3), #models th:nth-child(-n+3) { text-align: left }
 #mcp tbody tr { cursor: auto }
 </style>
 <h1>mentatd-serve</h1>
@@ -459,7 +464,7 @@ function render(d) {
     model: m.model, healthy: m.healthy,
     cells: [
       esc(m.model) + (m.healthy ? "" : " (" + esc(m.why_not || "down") + ")"),
-      esc(m.group), m.inflight, n(m.running), n(m.waiting),
+      esc(m.group), esc((m.nodes || []).join(", ")), m.inflight, n(m.running), n(m.waiting),
       m.kv === undefined || m.kv === null ? "-" : n(m.kv * 100, 1) + "%",
       n(m.prompt_tokens), n(m.generation_tokens),
       n(m.ttft_s, 2), n(m.queue_s, 2),
@@ -469,7 +474,7 @@ function render(d) {
   }));
   put("models", table(
     "models (click to focus)",
-    ["model", "group", "proxied", "running", "waiting", "kv", "prompt tok", "gen tok", "ttft s", "queue s", "itl ms", "preempt"],
+    ["model", "group", "nodes", "proxied", "running", "waiting", "kv", "prompt tok", "gen tok", "ttft s", "queue s", "itl ms", "preempt"],
     rows,
     { key: r => r.model, selected: r => r.model === sel, dead: r => !r.healthy }));
 
@@ -477,11 +482,12 @@ function render(d) {
   const mcpUrl = new URL("mcp", location.href).href;
   put("mcp", table(
     "MCP at " + esc(mcpUrl),
-    ["group", "tools"],
+    ["group", "nodes", "tools"],
     (d.mcp || []).map(g => ({
       tools: g.tools,
       cells: [
         esc(g.group),
+        esc((g.nodes || []).join(", ")),
         g.tools ? esc(g.tools.join(", ") || "none")
           : g.error ? "no answer: " + esc(g.error) : "listing",
       ],
