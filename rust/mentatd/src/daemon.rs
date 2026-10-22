@@ -1418,7 +1418,8 @@ fn claim(
         c.holders.insert(client_id.to_string());
         return Ok((c.generation, c.view.clone()));
     }
-    let req = crate::claim::parse(shape).map_err(|e| Msg::refused("bad_shape", e))?;
+    let mut req = crate::claim::parse(shape).map_err(|e| Msg::refused("bad_shape", e))?;
+    req.driver = st.clients.get(client_id).map(|c| c.node_id.clone());
     let topo = crate::claim::topology(st);
     let solution =
         crate::claim::solve(&topo, &req).map_err(|e| Msg::refused("unsolvable_claim", e))?;
@@ -2361,13 +2362,14 @@ fn fit(
 /// to its environment.
 type RankOrder = Vec<(String, BTreeMap<String, String>)>;
 
-/// The rank order for a claim of one ring or line set, as this driver
-/// needs it. None for any other claim.
+/// The rank order for a claim of one ring, line or star set, as this
+/// driver needs it. None for any other claim.
 ///
 /// vLLM expects rank 0 on the driver's node. A ring is rotated to put it
 /// there. A line is reversed when the driver is on its far end, and refused
 /// when the driver is inside it, since no order then has rank 0 on the
-/// driver's node.
+/// driver's node. A star is refused when the driver is on a leaf, since its
+/// hub is rank 0.
 fn claim_order(
     st: &State,
     group: &str,
@@ -2383,14 +2385,13 @@ fn claim_order(
     if !set.layout.ordered() {
         return None;
     }
-    let mut order: Vec<(String, Value, Value)> = c.view["sets"][&set.name]
+    let mut order: Vec<(String, Value)> = c.view["sets"][&set.name]
         .as_array()?
         .iter()
         .map(|m| {
             (
                 m["node"].as_str().unwrap_or_default().to_string(),
-                m["prev"].clone(),
-                m["next"].clone(),
+                m.clone(),
             )
         })
         .collect();
@@ -2402,8 +2403,10 @@ fn claim_order(
         (Layout::Ring, Some(i)) => order.rotate_left(i),
         (Layout::Line, Some(i)) if i == last && i > 0 => {
             order.reverse();
-            for m in &mut order {
-                std::mem::swap(&mut m.1, &mut m.2);
+            for (_, m) in &mut order {
+                let (prev, next) = (m["prev"].take(), m["next"].take());
+                m["prev"] = next;
+                m["next"] = prev;
             }
         }
         (Layout::Line, Some(i)) if i > 0 => {
@@ -2412,31 +2415,53 @@ fn claim_order(
                  the driver on a node at one end of the line"
             )))
         }
+        (Layout::Star, Some(i)) if i > 0 => {
+            let hub = c.view["sets"][&set.name][0]["host"]
+                .as_str()
+                .unwrap_or(&order[0].0)
+                .to_string();
+            return Some(Err(format!(
+                "claim {claim:?} is a star with its hub on {hub}, and the driver's node \
+                 is a leaf. Start the driver on {hub}"
+            )));
+        }
         _ => {}
     }
     Some(Ok(order
         .into_iter()
-        .map(|(n, prev, next)| (n, rank_env(set.layout, &prev, &next)))
+        .map(|(n, m)| (n, rank_env(set.layout, &m)))
         .collect()))
 }
 
-/// The variables that name a ring or line rank's neighbours: each
-/// neighbour's address and the local interface that reaches it.
-fn rank_env(layout: crate::claim::Layout, prev: &Value, next: &Value) -> BTreeMap<String, String> {
+/// The variables that name a rank's neighbours in a ring, line or star:
+/// each neighbour's address and the local interface that reaches it.
+fn rank_env(layout: crate::claim::Layout, member: &Value) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    let name = if layout == crate::claim::Layout::Ring {
-        "ring"
-    } else {
-        "line"
-    };
-    env.insert("MENTAT_FABRIC_LAYOUT".to_string(), name.to_string());
+    env.insert(
+        "MENTAT_FABRIC_LAYOUT".to_string(),
+        layout.name().to_string(),
+    );
     let mut ifaces: Vec<&str> = Vec::new();
-    for (key, p) in [("PREV", prev), ("NEXT", next)] {
+    for (key, p) in [("PREV", "prev"), ("NEXT", "next"), ("HUB", "hub")] {
+        let p = &member[p];
         if let Some(addr) = p["addr"].as_str() {
             env.insert(format!("MENTAT_FABRIC_{key}"), addr.to_string());
         }
         if let Some(iface) = p["iface"].as_str() {
             env.insert(format!("MENTAT_FABRIC_{key}_IFACE"), iface.to_string());
+            if !ifaces.contains(&iface) {
+                ifaces.push(iface);
+            }
+        }
+    }
+    let leaves = member["leaves"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if !leaves.is_empty() {
+        let addrs: Vec<&str> = leaves.iter().filter_map(|p| p["addr"].as_str()).collect();
+        env.insert("MENTAT_FABRIC_LEAVES".to_string(), addrs.join(","));
+        for iface in leaves.iter().filter_map(|p| p["iface"].as_str()) {
             if !ifaces.contains(&iface) {
                 ifaces.push(iface);
             }
@@ -3372,6 +3397,51 @@ mod tests {
         let st = with_ordered_claim("line", &["nA", "nB", "nC"]);
         let e = claim_order(&st, "g", "c", "nB").unwrap().unwrap_err();
         assert!(e.contains("inside"), "{e}");
+    }
+
+    /// A claim `c` of one star set with its hub on the first named node.
+    /// Leaf `i` reaches the hub from 10.0.i.2 to 10.0.i.1 on `pi`.
+    fn with_star_claim(nodes: &[&str]) -> State {
+        let mut st = with_ordered_claim("star", nodes);
+        let spoke = |i: usize, to: usize, here: &str, there: &str| {
+            json!({"node": nodes[to], "host": nodes[to].to_lowercase(),
+                   "addr": format!("10.0.{i}.{there}"), "bind": format!("10.0.{i}.{here}"),
+                   "iface": format!("p{i}")})
+        };
+        let mut members = vec![json!({"node": nodes[0], "host": nodes[0].to_lowercase(),
+            "leaves": (1..nodes.len()).map(|i| spoke(i, i, "1", "2")).collect::<Vec<_>>()})];
+        members.extend(
+            (1..nodes.len()).map(|i| json!({"node": nodes[i], "hub": spoke(i, 0, "2", "1")})),
+        );
+        st.claims.get_mut(&("g".into(), "c".into())).unwrap().view =
+            json!({"sets": {"tp": members}, "between": []});
+        st
+    }
+
+    /// The hub is rank 0, and each leaf learns the hub's address on its
+    /// own cable.
+    #[test]
+    fn a_star_claim_starts_at_its_hub() {
+        let st = with_star_claim(&["nB", "nA", "nC"]);
+        let order = claim_order(&st, "g", "c", "nB").unwrap().unwrap();
+        assert_eq!(ranks(&order), ["nB", "nA", "nC"]);
+        let hub = &order[0].1;
+        assert_eq!(hub["MENTAT_FABRIC_LAYOUT"], "star");
+        assert_eq!(hub["MENTAT_FABRIC_LEAVES"], "10.0.1.2,10.0.2.2");
+        assert_eq!(hub["MENTAT_FABRIC_IFACES"], "p1,p2");
+        assert!(!hub.contains_key("MENTAT_FABRIC_HUB"));
+        let leaf = &order[2].1;
+        assert_eq!(leaf["MENTAT_FABRIC_HUB"], "10.0.2.1");
+        assert_eq!(leaf["MENTAT_FABRIC_HUB_IFACE"], "p2");
+        assert_eq!(leaf["MENTAT_FABRIC_IFACES"], "p2");
+        assert!(!leaf.contains_key("MENTAT_FABRIC_LEAVES"));
+    }
+
+    #[test]
+    fn a_star_claim_with_the_driver_on_a_leaf_is_refused() {
+        let st = with_star_claim(&["nB", "nA", "nC"]);
+        let e = claim_order(&st, "g", "c", "nC").unwrap().unwrap_err();
+        assert!(e.contains("hub on nb"), "{e}");
     }
 
     /// A mesh claim keeps its pooled placement.

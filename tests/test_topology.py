@@ -536,6 +536,37 @@ RING = [
 ]
 
 
+def claimed_ranks(daemon, claim, layout, n, keys):
+    """Run a driver on `daemon` that places `n` one-GPU ranks under a claim
+    of `layout`, and return the `keys` of each rank's environment."""
+    driver = f"""
+import json, os, sys
+sys.path[:0] = os.environ["PYTHONPATH"].split(os.pathsep)
+import ray
+from ray.util.placement_group import placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy as PGS
+from fake_worker import FakeWorker
+ray.init()
+pg = placement_group([{{"GPU": 1.0}}] * {n})
+assert ray.wait([pg.ready()], timeout=60)[0], "the claim never placed"
+ws = [ray.remote(FakeWorker).options(
+          num_gpus=1, scheduling_strategy=PGS(placement_group=pg,
+                                              placement_group_bundle_index=i)).remote(rank=i)
+      for i in range({n})]
+envs = ray.get([w.env_dump.remote() for w in ws], timeout=60)
+print(json.dumps([{{k: e.get(k, "") for k in {list(keys)!r}}} for e in envs]), flush=True)
+"""
+    r = subprocess.run(
+        [sys.executable, "-c", driver],
+        env={**os.environ, "RAY_ADDRESS": daemon.address, "MENTAT_GROUP": "ring",
+             "MENTAT_CLAIM": claim, "MENTAT_CLAIM_LAYOUT": layout,
+             "PYTHONPATH": os.pathsep.join([tl.PYTHON_PKG, HERE])},
+        capture_output=True, text=True, timeout=180,
+    )
+    assert r.returncode == 0, (r.stdout + r.stderr)[-1500:]
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
 def t12_a_ring_claim_places_in_cable_order():
     """No three of the four boxes share a cable, so a four-rank group has no
     island. A ring claim places it anyway: in cable order, starting at the
@@ -578,34 +609,9 @@ def t12_a_ring_claim_places_in_cable_order():
         20, "four ring agents on the head",
     )
 
-    driver = """
-import json, os, sys
-sys.path[:0] = os.environ["PYTHONPATH"].split(os.pathsep)
-import ray
-from ray.util.placement_group import placement_group
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy as PGS
-from fake_worker import FakeWorker
-ray.init()
-pg = placement_group([{"GPU": 1.0}] * 4)
-assert ray.wait([pg.ready()], timeout=30)[0], "the ring claim never placed"
-ws = [ray.remote(FakeWorker).options(
-          num_gpus=1, scheduling_strategy=PGS(placement_group=pg,
-                                              placement_group_bundle_index=i)).remote(rank=i)
-      for i in range(4)]
-keys = ("MENTAT_NODE_IP", "MENTAT_FABRIC_LAYOUT", "MENTAT_FABRIC_PREV",
-        "MENTAT_FABRIC_NEXT", "MENTAT_FABRIC_IP")
-envs = ray.get([w.env_dump.remote() for w in ws], timeout=60)
-print(json.dumps([{k: e.get(k, "") for k in keys} for e in envs]), flush=True)
-"""
-    r = subprocess.run(
-        [sys.executable, "-c", driver],
-        env={**os.environ, "RAY_ADDRESS": daemons["r3"].address, "MENTAT_GROUP": "ring",
-             "MENTAT_CLAIM": "ring-tp4", "MENTAT_CLAIM_LAYOUT": "ring",
-             "PYTHONPATH": os.pathsep.join([tl.PYTHON_PKG, HERE])},
-        capture_output=True, text=True, timeout=120,
-    )
-    assert r.returncode == 0, (r.stdout + r.stderr)[-1500:]
-    ranks = json.loads(r.stdout.strip().splitlines()[-1])
+    ranks = claimed_ranks(daemons["r3"], "ring-tp4", "ring", 4, (
+        "MENTAT_NODE_IP", "MENTAT_FABRIC_LAYOUT", "MENTAT_FABRIC_PREV",
+        "MENTAT_FABRIC_NEXT", "MENTAT_FABRIC_IP"))
 
     # Rank 0 on the driver's box, then around the ring.
     assert [x["MENTAT_NODE_IP"] for x in ranks] == [
@@ -617,6 +623,30 @@ print(json.dumps([{k: e.get(k, "") for k in keys} for e in envs]), flush=True)
         "10.110.2.1", "10.110.3.1", "10.110.4.1", "10.110.1.1"], ranks
     assert {x["MENTAT_FABRIC_LAYOUT"] for x in ranks} == {"ring"}, ranks
     # No one address reaches every rank on a ring.
+    assert {x["MENTAT_FABRIC_IP"] for x in ranks} == {""}, ranks
+
+
+def t12b_a_star_claim_puts_its_hub_on_the_driver():
+    """On the ring, each box is cabled to its two neighbours, so a star of
+    three fits with any box as the hub. The driver's box gets it, and each
+    leaf is told the hub's address on its own cable."""
+    daemons = state["ring_daemons"]
+    ranks = claimed_ranks(daemons["r3"], "ring-star3", "star", 3, (
+        "MENTAT_NODE_IP", "MENTAT_FABRIC_LAYOUT", "MENTAT_FABRIC_HUB",
+        "MENTAT_FABRIC_LEAVES", "MENTAT_FABRIC_IP"))
+    hub, *leaves = ranks
+    assert hub["MENTAT_NODE_IP"] == "192.168.5.3", ranks
+    # r3's cables: 10.110.2.x to r2 and 10.110.3.x to r4.
+    far = {"192.168.5.2": ("10.110.2.2", "10.110.2.1"),
+           "192.168.5.4": ("10.110.3.1", "10.110.3.2")}
+    assert sorted(x["MENTAT_NODE_IP"] for x in leaves) == sorted(far), ranks
+    for x in leaves:
+        assert x["MENTAT_FABRIC_HUB"] == far[x["MENTAT_NODE_IP"]][0], ranks
+        assert x["MENTAT_FABRIC_LEAVES"] == "", ranks
+    assert hub["MENTAT_FABRIC_LEAVES"] == ",".join(
+        far[x["MENTAT_NODE_IP"]][1] for x in leaves), ranks
+    assert hub["MENTAT_FABRIC_HUB"] == "", ranks
+    assert {x["MENTAT_FABRIC_LAYOUT"] for x in ranks} == {"star"}, ranks
     assert {x["MENTAT_FABRIC_IP"] for x in ranks} == {""}, ranks
 
 
@@ -636,6 +666,7 @@ def main():
         t10b_the_router_reports_the_fabric_links,
         t11_the_router_forgets_a_dead_daemon,
         t12_a_ring_claim_places_in_cable_order,
+        t12b_a_star_claim_puts_its_hub_on_the_driver,
     ]
     try:
         for t in tests:

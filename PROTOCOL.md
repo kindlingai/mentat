@@ -252,17 +252,22 @@ reserve the GPUs. Two groups may claim one node and compete for its devices.
 | --- | --- |
 | `bundles` | A count of nodes at one GPU each, or a list of GPUs per node |
 | `link` | `rdma` or `ip`. An `rdma` set goes inside one fabric island (see "Placement") |
-| `layout?` | `mesh` (the default), `ring` or `line` |
+| `layout?` | `mesh` (the default), `ring`, `line` or `star` |
 | `vendor` | Pins the set to one GPU vendor. Without it the daemon picks one |
 
 A `mesh` set is one island: every member links to every other. A `ring` set
 is an order of members in which each links to the next, and the last to the
-first. A `line` set is an order in which each links to the next. A ring or
-line link is a probed pair of `link` addresses, with both ends tagged `rdma`
-for an `rdma` set. A pair the prober marked `direct: false` goes through
-another box. A mesh counts it, and a ring or a line leaves it out. A mesh
-holds every ring, a ring holds every line, and two members on one cable are
-all three.
+first. A `line` set is an order in which each links to the next. A `star`
+set is a hub, listed first, that links to every other member. A ring, line
+or star link is a probed pair of `link` addresses, with both ends tagged
+`rdma` for an `rdma` set. A pair the prober marked `direct: false` goes
+through another box. A mesh counts it, and a ring, a line or a star leaves
+it out. A mesh holds every ring and every star, a ring holds every line, and
+two members on one cable are all four.
+
+A star puts its hub on the node of the client that sent the claim when that
+node can be a hub. A daemon that does not know `star` refuses the claim with
+`bad_shape`.
 
 A daemon that predates `layout` drops the key and solves the set as a mesh.
 That placement is also a valid ring and line.
@@ -282,13 +287,15 @@ That placement is also a valid ring and line.
 
 | Field | Value |
 | --- | --- |
-| `bind` | The address the rank binds. In a ring or a line, the port toward `next`, or toward `prev` at a line's end |
+| `bind` | The address the rank binds. In a ring or a line, the port toward `next`, or toward `prev` at a line's end. In a star, a leaf's port toward `hub`, and the hub's port toward its first leaf |
 | `iface` | Null for an address from `MENTAT_ANNOUNCE_ADDRS` |
 | `prev?`, `next?` | In a ring or a line, the member before and after this one: `node`, `host`, `addr` (the far end of the cable), and `bind` and `iface` (this end) |
+| `hub?` | In a star, a leaf's link to the hub, in the form of `next` |
+| `leaves?` | In a star, the hub's link to each leaf in member order, each in the form of `next` |
 | `rtt_ms` | The round trip a probe observed |
 
-A ring or a line lists its members in order. A ring starts at its lowest
-node id.
+A ring, a line or a star lists its members in order. A ring starts at its
+lowest node id. A star starts at its hub.
 
 A claim on a name held for a different shape is refused. Re-solving would
 move nodes under the first claimant. Only the head solves a claim. A claim
@@ -309,11 +316,12 @@ reaches the new head, which solves the shape again.
 placement group that requests more than its claim holds stays pending.
 Placing outside the claim would split ranks that agreed on one view.
 
-A claim of one `ring` or `line` set places bundle `i` on member `i`, and
-needs one bundle per member. vLLM puts rank 0 on the driver's node. So a
-ring is turned to start at the driver's node, and a line is reversed when
-the driver is on its last member. A line with the driver on an inner member
-stays pending with the reason. Each rank's spawn `env` names its neighbours
+A claim of one `ring`, `line` or `star` set places bundle `i` on member
+`i`, and needs one bundle per member. vLLM puts rank 0 on the driver's node.
+So a ring is turned to start at the driver's node, and a line is reversed
+when the driver is on its last member. A line with the driver on an inner
+member, or a star with the driver on a leaf, stays pending with the
+reason. Each rank's spawn `env` names its neighbours
 (GUIDE.md, "Actor process"), and no rank gets `MENTAT_FABRIC_IP`.
 
 ## Agent link
