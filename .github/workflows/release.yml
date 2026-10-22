@@ -67,8 +67,65 @@ jobs:
       ref: ${{ needs.tag.outputs.tag }}
       publish: true
 
-  publish:
+  join:
     needs: [tag, test, image]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    env:
+      TAG: ${{ needs.tag.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: build-*
+          path: build/
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Join the architectures under the version tag
+        run: |
+          v=${TAG#v}
+          for i in $IMAGES; do
+            docker buildx imagetools create -t "$REGISTRY/$i:$v" \
+              "$(cat "build/build-amd64/digests/$i")" "$(cat "build/build-arm64/digests/$i")"
+            docker buildx imagetools inspect "$REGISTRY/$i:$v" | grep Platform
+          done
+
+  # Each architecture runs on its own runner. QEMU on the amd64 runner
+  # cannot start the arm64 image: exec reports "exec format error".
+  check:
+    needs: [tag, join]
+    name: check / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: blacksmith-2vcpu-ubuntu-2404
+          - arch: arm64
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
+    env:
+      TAG: ${{ needs.tag.outputs.tag }}
+    steps:
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Check the version tag runs here and reports the tag
+        run: |
+          v=${TAG#v}
+          arch=${{ matrix.arch }}
+          got=$(docker run --rm --pull always --platform "linux/$arch" "$REGISTRY/mentatd:$v" --version)
+          echo "mentatd $arch: $got"
+          [ "$got" = "mentatd $v" ]
+          got=$(docker run --rm --pull always --platform "linux/$arch" "$REGISTRY/mentat-artifacts:$v" /out/mentatd --version)
+          echo "mentat-artifacts $arch: $got"
+          [ "$got" = "mentatd $v" ]
+
+  publish:
+    needs: [tag, check]
     runs-on: blacksmith-2vcpu-ubuntu-2404
     env:
       TAG: ${{ needs.tag.outputs.tag }}
@@ -79,8 +136,6 @@ jobs:
         with:
           pattern: build-*
           path: build/
-      # QEMU only so the arm64 image can be run below.
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -91,25 +146,6 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Join the architectures under the version tag
-        run: |
-          v=${TAG#v}
-          for i in $IMAGES; do
-            docker buildx imagetools create -t "$REGISTRY/$i:$v" \
-              "$(cat "build/build-amd64/digests/$i")" "$(cat "build/build-arm64/digests/$i")"
-            docker buildx imagetools inspect "$REGISTRY/$i:$v" | grep Platform
-          done
-      - name: Check each architecture runs and reports the tag
-        run: |
-          v=${TAG#v}
-          for arch in amd64 arm64; do
-            got=$(docker run --rm --pull always --platform "linux/$arch" "$REGISTRY/mentatd:$v" --version)
-            echo "mentatd $arch: $got"
-            [ "$got" = "mentatd $v" ]
-            got=$(docker run --rm --pull always --platform "linux/$arch" "$REGISTRY/mentat-artifacts:$v" /out/mentatd --version)
-            echo "mentat-artifacts $arch: $got"
-            [ "$got" = "mentatd $v" ]
-          done
       # The copy is the joined image, so Docker Hub gets no architecture
       # tags to clean up.
       - name: Copy the images to Docker Hub
