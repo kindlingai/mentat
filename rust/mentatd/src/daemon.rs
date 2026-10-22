@@ -105,6 +105,7 @@ pub fn run(opts: DaemonOpts) -> std::io::Result<()> {
             ("addr", control_addr.clone()),
             ("node_id", shared.st.lock().unwrap().node_id.clone()),
             ("hostname", hostname),
+            ("version", env!("CARGO_PKG_VERSION").to_string()),
         ],
     );
 
