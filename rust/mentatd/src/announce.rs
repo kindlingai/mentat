@@ -517,6 +517,25 @@ pub fn local_addr_ifaces() -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The netmask of each address discovered from an interface. Addresses
+/// from MENTAT_ANNOUNCE_ADDRS have none.
+pub fn local_addr_masks() -> BTreeMap<String, std::net::Ipv4Addr> {
+    if announced_override().is_some() {
+        return BTreeMap::new();
+    }
+    selected_ifaces()
+        .into_iter()
+        .filter_map(
+            |i| match (i.iface.address.ip_addr(), i.iface.address.netmask()) {
+                (Some(std::net::IpAddr::V4(a)), Some(std::net::IpAddr::V4(m))) => {
+                    Some((a.to_string(), m))
+                }
+                _ => None,
+            },
+        )
+        .collect()
+}
+
 /// The MAC of each address's interface, for the addresses
 /// `local_addr_ifaces` places. A prober compares it with the MAC that
 /// answered ARP for the address. Empty where sysfs is missing.

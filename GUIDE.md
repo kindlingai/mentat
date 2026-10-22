@@ -418,9 +418,11 @@ wrong cable, and `probe_port_ambiguous` logs the local address. Set
 `net.ipv4.conf.all.arp_ignore=1` and `arp_announce=2`, or give each cable its
 own subnet.
 
-A DGX Spark shows each QSFP port as two interfaces on one wire. Each one
-reaches both of the far box's, and both answer ARP with their own MACs.
-mentat treats the pair as one cable.
+A DGX Spark shows each QSFP port as two interfaces on one wire, one per PCI
+root. In one subnet, each one reaches both of the far box's, and both
+answer ARP with their own MACs. mentat treats the pair as one cable. With a
+subnet per root, a fabric probe stays on its own subnet, so each root
+reaches only the far boxes' interfaces on that root's subnet.
 
 ### Islands
 
@@ -503,7 +505,9 @@ A ring or line member with two ports can reach its two neighbours on
 different ports. Four boxes with their first port on a switch, and cabled in
 pairs on their second ports, then ring over a cable and the switch in turn,
 and every box uses both ports. A DGX Spark shows each QSFP port as two
-interfaces, and the two count as one port. A set's `ports` picks the rule:
+interfaces. In one subnet the two count as one port. With a subnet per root
+they count as two, and a ring splits each box's neighbours across the
+roots. A set's `ports` picks the rule:
 
 | `ports` | Each member reaches its two neighbours |
 | --- | --- |

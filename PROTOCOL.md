@@ -462,7 +462,14 @@ prober reads the ARP entry for the remote address on that interface into
 entry for the address. `direct` is false when another box answered ARP for
 the address and forwards to it, and null when either MAC is unknown.
 
-Each daemon probes every address pair (own address, peer address) once per
+A bound probe goes only to peer addresses in its own address's subnet.
+Linux sends a bound socket's packets out the interface even without a route
+there. So where two of a box's interfaces share a switch, each on its own
+subnet, the far box answers on the other subnet as well, and the pair looks
+`direct`. RDMA cannot use that pair, since it needs both ends in one
+subnet. An address with no known netmask, such as one from `MENTAT_ANNOUNCE_ADDRS`, probes every peer address.
+
+Each daemon probes every other address pair (own address, peer address) once per
 `MENTAT_PROBE_INTERVAL_MS`. A probe times out at `MENTAT_PROBE_TIMEOUT_MS`.
 Peers are probed in parallel. Results appear per peer under `probes` in the
 snapshot. An entry exists once the pair has been tried. A row whose local

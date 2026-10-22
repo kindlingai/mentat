@@ -1779,6 +1779,128 @@ mod tests {
         }
     }
 
+    /// Issue 3: four boxes whose two PCI roots share one switch port, each
+    /// root on its own subnet. The prober links only same-subnet pairs, so
+    /// every neighbour's address sits on the interface named with it, and
+    /// each member still splits its two neighbours across the roots.
+    #[test]
+    fn a_ring_over_two_roots_pairs_each_address_with_its_interface() {
+        let mut t = Topology::default();
+        let roots = [("100", "enp1s0f0np0"), ("101", "enP2p1s0f0np0")];
+        for i in 1..=4 {
+            let ports = roots
+                .iter()
+                .map(|(net, iface)| port(&format!("10.{net}.0.{i}"), iface, &["rdma"]))
+                .collect();
+            t.ports.insert(format!("n{i}"), ports);
+            t.free_gpus.insert(format!("n{i}"), 1.0);
+        }
+        for (net, _) in roots {
+            for i in 1..=4 {
+                for j in i + 1..=4 {
+                    t.links
+                        .insert((format!("10.{net}.0.{i}"), format!("10.{net}.0.{j}")), 0);
+                }
+            }
+        }
+        let s = solve(&t, &laid_out("tp", 4, Layout::Ring)).unwrap();
+        let net = |a: &str| a.split('.').nth(1).unwrap().to_string();
+        let on = |iface: &Option<String>| {
+            roots
+                .iter()
+                .find(|(_, i)| Some(i.to_string()) == *iface)
+                .unwrap()
+                .0
+                .to_string()
+        };
+        for m in &s.sets["tp"] {
+            let (p, q) = (m.prev.as_ref().unwrap(), m.next.as_ref().unwrap());
+            for l in [p, q] {
+                assert_eq!(net(&l.remote.addr), on(&l.local.iface), "{m:?}");
+                assert_eq!(net(&l.local.addr), net(&l.remote.addr), "{m:?}");
+            }
+            assert_ne!(p.local.iface, q.local.iface, "{m:?}");
+        }
+    }
+
+    /// Seven boxes: A to F on one switch, each switch port showing two PCI
+    /// roots with a subnet per root, and second-port cables A-B and F-G.
+    /// The prober links only same-subnet pairs.
+    fn switch_with_two_cables() -> Topology {
+        let mut t = Topology::default();
+        let roots = [("100", "enp1s0f0np0"), ("101", "enP2p1s0f0np0")];
+        let names = ["nA", "nB", "nC", "nD", "nE", "nF", "nG"];
+        for (i, n) in names.iter().enumerate() {
+            let mut ports: Vec<Port> = Vec::new();
+            if *n != "nG" {
+                for (net, iface) in roots {
+                    ports.push(port(&format!("10.{net}.0.{i}"), iface, &["rdma"]));
+                }
+            }
+            let cable = match *n {
+                "nA" | "nB" => Some("110"),
+                "nF" | "nG" => Some("111"),
+                _ => None,
+            };
+            if let Some(net) = cable {
+                ports.push(port(&format!("10.{net}.0.{i}"), "enp1s0f1np1", &["rdma"]));
+            }
+            t.ports.insert(n.to_string(), ports);
+            t.free_gpus.insert(n.to_string(), 1.0);
+        }
+        for (net, _) in roots {
+            for i in 0..6 {
+                for j in i + 1..6 {
+                    t.links
+                        .insert((format!("10.{net}.0.{i}"), format!("10.{net}.0.{j}")), 0);
+                }
+            }
+        }
+        t.links
+            .insert(("10.110.0.0".into(), "10.110.0.1".into()), 0);
+        t.links
+            .insert(("10.111.0.5".into(), "10.111.0.6".into()), 0);
+        t
+    }
+
+    #[test]
+    fn a_switch_with_two_cables_places_each_layout() {
+        let t = switch_with_two_cables();
+        let net = |a: &str| a.split('.').nth(1).unwrap().to_string();
+
+        // A ring of six on the switch splits every box across its roots.
+        let mut r = laid_out("tp", 6, Layout::Ring);
+        r.sets[0].ports = Ports::Split;
+        let s = solve(&t, &r).unwrap();
+        assert!(!order(&s, "tp").contains(&"nG".to_string()));
+        for m in &s.sets["tp"] {
+            let (p, q) = (m.prev.as_ref().unwrap(), m.next.as_ref().unwrap());
+            assert_ne!(p.local.iface, q.local.iface, "{m:?}");
+            for l in [p, q] {
+                assert_eq!(net(&l.local.addr), net(&l.remote.addr), "{m:?}");
+            }
+        }
+
+        // G has one neighbour, so no ring of seven, and a line of seven
+        // ends at G.
+        assert!(solve(&t, &laid_out("tp", 7, Layout::Ring)).is_err());
+        let s = solve(&t, &laid_out("pp", 7, Layout::Line)).unwrap();
+        let o = order(&s, "pp");
+        assert!(o[0] == "nG" || o[6] == "nG", "{o:?}");
+
+        // F reaches A to E by the switch and G by its cable: the only hub
+        // of a star of seven.
+        let mut r = laid_out("tp", 7, Layout::Star);
+        r.driver = Some("nC".into());
+        assert_eq!(order(&solve(&t, &r).unwrap(), "tp")[0], "nF");
+
+        // A and B ring over both the cable and the switch.
+        let mut r = laid_out("tp", 2, Layout::Ring);
+        r.sets[0].ports = Ports::Split;
+        let s = solve(&t, &r).unwrap();
+        assert_eq!(order(&s, "tp"), ["nA", "nB"]);
+    }
+
     /// Two boxes joined by two cables ring over both.
     #[test]
     fn two_cables_make_a_ring_of_two_on_both() {

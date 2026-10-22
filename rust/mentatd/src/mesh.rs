@@ -941,6 +941,7 @@ fn prober(shared: SharedRef) {
             crate::announce::local_addr_ifaces(),
             &crate::announce::local_addr_tags(),
         );
+        let masks = crate::announce::local_addr_masks();
         // Peers worth probing: alive, probe-replying, and with a control
         // port to aim at. Collected before any connecting so the state lock
         // is never held across a network wait.
@@ -959,11 +960,13 @@ fn prober(shared: SharedRef) {
                 let my_id = my_id.clone();
                 let locals = locals.clone();
                 let bind_ifaces = bind_ifaces.clone();
+                let masks = masks.clone();
                 std::thread::spawn(move || {
                     let me = Prober {
                         my_id: &my_id,
                         locals: &locals,
                         bind_ifaces: &bind_ifaces,
+                        masks: &masks,
                         timeout,
                     };
                     probe_peer(&shared, &me, &peer_id, port, &remotes)
@@ -983,7 +986,39 @@ struct Prober<'a> {
     /// Each `rdma`-tagged local address, mapped to the interface its
     /// probes leave on.
     bind_ifaces: &'a BTreeMap<String, String>,
+    /// The netmask of each local address that has one.
+    masks: &'a BTreeMap<String, std::net::Ipv4Addr>,
     timeout: Duration,
+}
+
+impl Prober<'_> {
+    /// Whether to probe `remote` from `local`. A probe bound to a fabric
+    /// interface goes only to the interface's own subnet. Linux sends a
+    /// bound socket's packets out the interface even with no route there,
+    /// so a box whose two ports share one switch would answer for its other
+    /// port's subnet. RDMA cannot use that pair. It needs both ends in one
+    /// subnet. A hop limit cannot tell it apart, since nothing between
+    /// the two ends counts as a hop.
+    fn probes(&self, local: &str, remote: &str) -> bool {
+        if !self.bind_ifaces.contains_key(local) {
+            return true;
+        }
+        let Some(mask) = self.masks.get(local) else {
+            return true;
+        };
+        match (
+            local.parse::<std::net::Ipv4Addr>(),
+            remote.parse::<std::net::Ipv4Addr>(),
+        ) {
+            (Ok(a), Ok(b)) => same_subnet(a, b, *mask),
+            _ => true,
+        }
+    }
+}
+
+fn same_subnet(a: std::net::Ipv4Addr, b: std::net::Ipv4Addr, mask: std::net::Ipv4Addr) -> bool {
+    let m = u32::from(mask);
+    u32::from(a) & m == u32::from(b) & m
 }
 
 /// The interface of each `rdma`-tagged local address.
@@ -1009,7 +1044,7 @@ fn fabric_ifaces(
 /// One round against one peer: every (local, remote) pair, then the prune.
 fn probe_peer(shared: &SharedRef, me: &Prober, peer_id: &str, port: u16, remotes: &[String]) {
     for local in me.locals {
-        for remote in remotes {
+        for remote in remotes.iter().filter(|r| me.probes(local, r)) {
             let iface = me.bind_ifaces.get(local).map(String::as_str);
             let r = probe_pair(me, peer_id, local, iface, remote, port);
             // A bound probe that answered resolved the remote address on its
@@ -1085,6 +1120,9 @@ fn probe_peer(shared: &SharedRef, me: &Prober, peer_id: &str, port: u16, remotes
     let mut st = shared.st.lock().unwrap();
     if let Some(p) = st.peers.get_mut(peer_id) {
         prune_pairs(&mut p.probe_pairs, me.locals, remotes);
+        for (local, row) in p.probe_pairs.iter_mut() {
+            row.retain(|remote, _| me.probes(local, remote));
+        }
         let now = ambiguous_ports(&p.probe_pairs, me.bind_ifaces, &p.addr_ifaces);
         for (local, reached) in &now {
             if !p.ambiguous_ports.contains(local) {
@@ -1372,15 +1410,52 @@ fn bind_iface(_fd: std::os::fd::RawFd, _name: &str) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ambiguous_ports, arp_entry, fabric_ifaces, same_box};
+    use super::{ambiguous_ports, arp_entry, fabric_ifaces, same_box, Prober};
     use crate::state::{PairProbe, ProbeTable};
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
             .iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect()
+    }
+
+    /// Issue 3: each Spark root has its own subnet, and both roots share
+    /// one switch. Root 0's bound probe reached the far box's root 1, and a
+    /// ring then paired a 10.101 address with root 0's interface.
+    #[test]
+    fn a_bound_probe_stays_on_its_subnet() {
+        let bind: BTreeMap<String, String> = [
+            ("10.100.0.1".to_string(), "enp1s0f0np0".to_string()),
+            ("10.101.0.1".to_string(), "enP2p1s0f0np0".to_string()),
+        ]
+        .into();
+        let mask: std::net::Ipv4Addr = "255.255.255.0".parse().unwrap();
+        let masks: BTreeMap<String, std::net::Ipv4Addr> = [
+            ("10.100.0.1".to_string(), mask),
+            ("10.101.0.1".to_string(), mask),
+            ("192.168.1.70".to_string(), mask),
+        ]
+        .into();
+        let locals = vec!["10.100.0.1".to_string()];
+        let me = Prober {
+            my_id: "me",
+            locals: &locals,
+            bind_ifaces: &bind,
+            masks: &masks,
+            timeout: Duration::from_millis(1),
+        };
+        assert!(me.probes("10.100.0.1", "10.100.0.2"));
+        assert!(!me.probes("10.100.0.1", "10.101.0.2"));
+        assert!(!me.probes("10.101.0.1", "10.100.0.2"));
+        // An unbound address routes, so a peer behind a router still counts.
+        assert!(me.probes("192.168.1.70", "192.168.3.7"));
+        // A bound address with no known netmask probes everything.
+        let none = BTreeMap::new();
+        let me = Prober { masks: &none, ..me };
+        assert!(me.probes("10.100.0.1", "10.101.0.2"));
     }
 
     fn table(rows: &[(&str, &str, bool)]) -> ProbeTable {
