@@ -1,6 +1,7 @@
 name: latest
 
-# Points latest at a published version. Releases never move it themselves.
+# Points latest at a published version, on ghcr and on Docker Hub. Releases
+# never move it themselves.
 on:
   workflow_dispatch:
     inputs:
@@ -13,6 +14,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io/${{ github.repository_owner }}
+  HUB: docker.io/mmastrac
   IMAGES: mentat-artifacts mentatd mentatd-serve mentat
 
 jobs:
@@ -25,6 +27,10 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Point latest at the version
         env:
           V: ${{ inputs.version }}
@@ -35,4 +41,6 @@ jobs:
           for i in $IMAGES; do
             docker buildx imagetools create -t "$REGISTRY/$i:latest" "$REGISTRY/$i:$V"
             docker buildx imagetools inspect "$REGISTRY/$i:latest" | grep Platform
+            docker buildx imagetools create -t "$HUB/$i:latest" "$HUB/$i:$V"
+            docker buildx imagetools inspect "$HUB/$i:latest" | grep Platform
           done

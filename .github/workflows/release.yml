@@ -2,7 +2,8 @@ name: release
 
 # Pushing a v* tag (v0.20.0) runs the tests, then publishes:
 #   - ghcr.io/kindlingai/{mentat-artifacts,mentatd,mentatd-serve,mentat}:<version>
-#     for linux/amd64 and linux/arm64
+#     for linux/amd64 and linux/arm64, and the same images on Docker Hub
+#     under mmastrac/
 #   - a GitHub release with static linux amd64/arm64 binaries, the shim wheel
 #     and SHA256SUMS, pre-release if the version has a suffix (v0.20.0-rc.1)
 # latest does not move here. Run latest.yml with the version to promote.
@@ -27,6 +28,7 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io/${{ github.repository_owner }}
+  HUB: docker.io/mmastrac
   IMAGES: mentat-artifacts mentatd mentatd-serve mentat
 
 jobs:
@@ -85,6 +87,10 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Join the architectures under the version tag
         run: |
           v=${TAG#v}
@@ -104,6 +110,15 @@ jobs:
             echo "mentat-artifacts $arch: $got"
             [ "$got" = "mentatd $v" ]
           done
+      # The copy is the joined image, so Docker Hub gets no architecture
+      # tags to clean up.
+      - name: Copy the images to Docker Hub
+        run: |
+          v=${TAG#v}
+          for i in $IMAGES; do
+            docker buildx imagetools create -t "$HUB/$i:$v" "$REGISTRY/$i:$v"
+            docker buildx imagetools inspect "$HUB/$i:$v" | grep Platform
+          done
       - name: Publish the release
         run: |
           v=${TAG#v}
@@ -118,6 +133,8 @@ jobs:
               d=$(docker buildx imagetools inspect --raw "$REGISTRY/$i:$v" | sha256sum | cut -d' ' -f1)
               echo "- \`$REGISTRY/$i:$v@sha256:$d\`"
             done
+            echo
+            echo "The same images are on Docker Hub as \`$HUB/<image>:$v\`."
           } > notes.md
           cat notes.md
           # A rerun replaces the assets of the release it made the first time.
