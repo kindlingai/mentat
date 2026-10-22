@@ -331,8 +331,9 @@ A claim of one `ring`, `line` or `star` set places bundle `i` on member
 So a ring is turned to start at the driver's node, and a line is reversed
 when the driver is on its last member. A line with the driver on an inner
 member, or a star with the driver on a leaf, stays pending with the
-reason. Each rank's spawn `env` names its neighbours
-(GUIDE.md, "Actor process"), and no rank gets `MENTAT_FABRIC_IP`.
+reason. Each rank's spawn `env` gives its position and names its
+neighbours (GUIDE.md, "Actor process"), and no rank gets
+`MENTAT_FABRIC_IP`.
 
 ## Agent link
 

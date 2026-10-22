@@ -840,6 +840,8 @@ of `MENTAT_FABRIC_IP`. No one address reaches every rank of a ring.
 | Variable | Value |
 | --- | --- |
 | `MENTAT_FABRIC_LAYOUT` | `ring`, `line` or `star` |
+| `MENTAT_FABRIC_RANK` | This rank's position in the claim's order, from 0 on the driver's node. It is the bundle index, which vLLM's Ray executor uses as the rank |
+| `MENTAT_FABRIC_SIZE` | The number of ranks in the claim's set |
 | `MENTAT_FABRIC_NEXT`, `MENTAT_FABRIC_PREV` | In a ring or a line, the next and previous rank's address on the cable to this rank |
 | `MENTAT_FABRIC_NEXT_IFACE`, `MENTAT_FABRIC_PREV_IFACE` | This rank's interface on that cable |
 | `MENTAT_FABRIC_HUB`, `MENTAT_FABRIC_HUB_IFACE` | On a star's leaf, the hub's address on the cable to this rank, and this rank's interface on it |

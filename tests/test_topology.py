@@ -625,7 +625,8 @@ def t12_a_ring_claim_places_in_cable_order():
 
     ranks = claimed_ranks(daemons["r3"], "ring-tp4", "ring", 4, (
         "MENTAT_NODE_IP", "MENTAT_FABRIC_LAYOUT", "MENTAT_FABRIC_PREV",
-        "MENTAT_FABRIC_NEXT", "MENTAT_FABRIC_IP"))
+        "MENTAT_FABRIC_NEXT", "MENTAT_FABRIC_IP", "MENTAT_FABRIC_RANK",
+        "MENTAT_FABRIC_SIZE"))
 
     # Rank 0 on the driver's box, then around the ring.
     assert [x["MENTAT_NODE_IP"] for x in ranks] == [
@@ -636,6 +637,9 @@ def t12_a_ring_claim_places_in_cable_order():
     assert [x["MENTAT_FABRIC_PREV"] for x in ranks] == [
         "10.110.2.1", "10.110.3.1", "10.110.4.1", "10.110.1.1"], ranks
     assert {x["MENTAT_FABRIC_LAYOUT"] for x in ranks} == {"ring"}, ranks
+    # Each rank knows its place in the ring, counted from the driver's box.
+    assert [x["MENTAT_FABRIC_RANK"] for x in ranks] == ["0", "1", "2", "3"], ranks
+    assert {x["MENTAT_FABRIC_SIZE"] for x in ranks} == {"4"}, ranks
     # No one address reaches every rank on a ring.
     assert {x["MENTAT_FABRIC_IP"] for x in ranks} == {""}, ranks
 

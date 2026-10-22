@@ -2427,20 +2427,30 @@ fn claim_order(
         }
         _ => {}
     }
+    let size = order.len();
     Some(Ok(order
         .into_iter()
-        .map(|(n, m)| (n, rank_env(set.layout, &m)))
+        .enumerate()
+        .map(|(i, (n, m))| (n, rank_env(set.layout, &m, i, size)))
         .collect()))
 }
 
-/// The variables that name a rank's neighbours in a ring, line or star:
-/// each neighbour's address and the local interface that reaches it.
-fn rank_env(layout: crate::claim::Layout, member: &Value) -> BTreeMap<String, String> {
+/// The variables for rank `rank` of `size` in a ring, line or star: its
+/// position, and each neighbour's address and the local interface that
+/// reaches it.
+fn rank_env(
+    layout: crate::claim::Layout,
+    member: &Value,
+    rank: usize,
+    size: usize,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert(
         "MENTAT_FABRIC_LAYOUT".to_string(),
         layout.name().to_string(),
     );
+    env.insert("MENTAT_FABRIC_RANK".to_string(), rank.to_string());
+    env.insert("MENTAT_FABRIC_SIZE".to_string(), size.to_string());
     let mut ifaces: Vec<&str> = Vec::new();
     for (key, p) in [("PREV", "prev"), ("NEXT", "next"), ("HUB", "hub")] {
         let p = &member[p];
@@ -3365,6 +3375,17 @@ mod tests {
         let st = with_ordered_claim("ring", &["nA", "nB", "nC", "nD"]);
         let order = claim_order(&st, "g", "c", "nC").unwrap().unwrap();
         assert_eq!(ranks(&order), ["nC", "nD", "nA", "nB"]);
+        // The position counts from the driver's node, after the turn.
+        let pos: Vec<(&str, &str)> = order
+            .iter()
+            .map(|(_, e)| {
+                (
+                    e["MENTAT_FABRIC_RANK"].as_str(),
+                    e["MENTAT_FABRIC_SIZE"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(pos, [("0", "4"), ("1", "4"), ("2", "4"), ("3", "4")]);
         let env = &order[0].1;
         assert_eq!(env["MENTAT_FABRIC_LAYOUT"], "ring");
         assert_eq!(env["MENTAT_FABRIC_NEXT"], "10.0.2.2");
@@ -3387,6 +3408,8 @@ mod tests {
         let st = with_ordered_claim("line", &["nA", "nB", "nC"]);
         let order = claim_order(&st, "g", "c", "nC").unwrap().unwrap();
         assert_eq!(ranks(&order), ["nC", "nB", "nA"]);
+        assert_eq!(order[0].1["MENTAT_FABRIC_RANK"], "0");
+        assert_eq!(order[2].1["MENTAT_FABRIC_RANK"], "2");
         assert!(!order[0].1.contains_key("MENTAT_FABRIC_PREV"));
         assert_eq!(order[0].1["MENTAT_FABRIC_NEXT_IFACE"], "p1");
         assert!(!order[2].1.contains_key("MENTAT_FABRIC_NEXT"));
@@ -3427,6 +3450,9 @@ mod tests {
         assert_eq!(ranks(&order), ["nB", "nA", "nC"]);
         let hub = &order[0].1;
         assert_eq!(hub["MENTAT_FABRIC_LAYOUT"], "star");
+        assert_eq!(hub["MENTAT_FABRIC_RANK"], "0");
+        assert_eq!(order[2].1["MENTAT_FABRIC_RANK"], "2");
+        assert_eq!(order[2].1["MENTAT_FABRIC_SIZE"], "3");
         assert_eq!(hub["MENTAT_FABRIC_LEAVES"], "10.0.1.2,10.0.2.2");
         assert_eq!(hub["MENTAT_FABRIC_IFACES"], "p1,p2");
         assert!(!hub.contains_key("MENTAT_FABRIC_HUB"));
