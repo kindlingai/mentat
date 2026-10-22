@@ -475,6 +475,14 @@ fn candidates(
                 rule,
                 steps: std::cell::Cell::new(0),
             };
+            let nodes = if rule == Rule::Split && set.layout == Layout::Ring {
+                match split_ring_nodes(t, set, groups, &nodes) {
+                    Some(n) => n,
+                    None => continue,
+                }
+            } else {
+                nodes.clone()
+            };
             w.walk(&nodes, &mut Vec::new(), Vec::new(), &mut found);
             for c in found {
                 if !out.contains(&c) {
@@ -557,6 +565,117 @@ struct Trail {
     leaves: String,
     arrives: String,
     links: Vec<Path>,
+}
+
+/// The nodes that can hold a split ring, or None when no split ring exists.
+///
+/// A split ring member reaches its two neighbours by two port groups, so a
+/// node with fewer than two groups that link to other usable nodes is left
+/// out, and leaving it out can strand another. A node with exactly two
+/// groups uses both, so a group that reaches only one node names a
+/// neighbour the ring must hold. Where those forced neighbours are mutual,
+/// they join the nodes into parts, and a ring holds each part whole or not
+/// at all. No split ring exists unless some parts add up to its size. Boxes
+/// on a switch and cabled in pairs are parts of two, so this refuses an odd
+/// split ring there before any search.
+fn split_ring_nodes<'a>(
+    t: &Topology,
+    set: &SetReq,
+    groups: &BTreeMap<String, String>,
+    nodes: &[&'a NodeId],
+) -> Option<Vec<&'a NodeId>> {
+    let want = set.bundles.len();
+    if want < 2 {
+        return Some(nodes.to_vec());
+    }
+    let least = set.bundles.iter().copied().fold(f64::INFINITY, f64::min);
+    let mut keep: Vec<&NodeId> = nodes
+        .iter()
+        .copied()
+        .filter(|n| t.free_gpus.get(*n).copied().unwrap_or(0.0) >= least)
+        .collect();
+    // Each kept node's port groups, and the kept nodes each one reaches.
+    let reach = |keep: &[&NodeId]| -> BTreeMap<NodeId, BTreeMap<String, BTreeSet<NodeId>>> {
+        let mut out: BTreeMap<NodeId, BTreeMap<String, BTreeSet<NodeId>>> = BTreeMap::new();
+        for &a in keep {
+            for &b in keep {
+                if a == b {
+                    continue;
+                }
+                for p in t.paths(a, b, set.link, true) {
+                    let g = groups
+                        .get(&p.local.addr)
+                        .cloned()
+                        .unwrap_or_else(|| p.local.addr.clone());
+                    out.entry(a.clone())
+                        .or_default()
+                        .entry(g)
+                        .or_default()
+                        .insert(b.clone());
+                }
+            }
+        }
+        out
+    };
+    let mut by_group = reach(&keep);
+    loop {
+        let before = keep.len();
+        keep.retain(|n| by_group.get(*n).is_some_and(|g| g.len() >= 2));
+        if keep.len() == before {
+            break;
+        }
+        by_group = reach(&keep);
+    }
+    if keep.len() < want {
+        return None;
+    }
+    let mut forced: BTreeMap<&NodeId, BTreeSet<&NodeId>> = BTreeMap::new();
+    for &n in &keep {
+        let gs = &by_group[n];
+        if gs.len() != 2 {
+            continue;
+        }
+        for to in gs.values().filter(|to| to.len() == 1) {
+            let x = keep.iter().copied().find(|k| to.contains(*k)).unwrap();
+            forced.entry(n).or_default().insert(x);
+        }
+    }
+    let mutual = forced.iter().all(|(n, xs)| {
+        xs.iter()
+            .all(|x| forced.get(x).is_some_and(|b| b.contains(n)))
+    });
+    if !mutual {
+        return Some(keep);
+    }
+    // The sizes of the parts forced neighbours join, then whether some of
+    // them add up to `want`.
+    let mut part: BTreeMap<&NodeId, usize> = BTreeMap::new();
+    let mut sizes = Vec::new();
+    for &n in &keep {
+        if part.contains_key(n) {
+            continue;
+        }
+        let mut todo = vec![n];
+        let mut size = 0;
+        part.insert(n, sizes.len());
+        while let Some(m) = todo.pop() {
+            size += 1;
+            for &x in forced.get(m).into_iter().flatten() {
+                if part.insert(x, sizes.len()).is_none() {
+                    todo.push(x);
+                }
+            }
+        }
+        sizes.push(size);
+    }
+    let mut sums = vec![false; want + 1];
+    sums[0] = true;
+    for size in sizes {
+        for total in (size..=want).rev() {
+            sums[total] |= sums[total - size];
+        }
+    }
+    sums[want].then_some(keep)
 }
 
 /// What a ring or line search asks of each member's two links.
@@ -2102,19 +2221,26 @@ mod tests {
     /// `n` nodes with two ports each. Each port is on a switch, cabled to a
     /// port of another node, or unused.
     fn two_port_graph(n: usize, rng: &mut Rng) -> Topology {
+        port_graph(n, 2, rng)
+    }
+
+    /// `n` nodes with `ports` ports each, as `two_port_graph` builds them.
+    fn port_graph(n: usize, ports: usize, rng: &mut Rng) -> Topology {
         let mut t = Topology::default();
         let addr = |i: usize, p: usize| format!("10.0.{p}.{i}");
         for i in 0..n {
             t.ports.insert(
                 format!("n{i}"),
-                (0..2).map(|p| port(&addr(i, p), "p", &["rdma"])).collect(),
+                (0..ports)
+                    .map(|p| port(&addr(i, p), "p", &["rdma"]))
+                    .collect(),
             );
             t.free_gpus.insert(format!("n{i}"), 1.0);
         }
         let mut switch = Vec::new();
         let mut loose = Vec::new();
         for i in 0..n {
-            for p in 0..2 {
+            for p in 0..ports {
                 match rng.below(3) {
                     0 => switch.push((i, p)),
                     1 => loose.push((i, p)),
@@ -2256,9 +2382,14 @@ mod tests {
     #[test]
     fn a_ports_rule_is_met_or_refused() {
         let mut rng = Rng(0x2545f4914f6cdd1d);
-        let n = 4;
-        for _ in 0..300 {
-            let t = two_port_graph(n, &mut rng);
+        for (n, ports, graphs) in [(4, 2, 300), (5, 2, 150), (4, 3, 600), (5, 3, 100)] {
+            check_ports_rule(n, ports, graphs, &mut rng);
+        }
+    }
+
+    fn check_ports_rule(n: usize, ports: usize, graphs: usize, rng: &mut Rng) {
+        for _ in 0..graphs {
+            let t = port_graph(n, ports, rng);
             for ports in [Ports::Split, Ports::Same] {
                 for layout in [Layout::Ring, Layout::Line] {
                     for k in 2..=n {
@@ -2304,7 +2435,54 @@ mod tests {
     /// visit every order, for over a minute, before `auto` fell back.
     #[test]
     fn an_odd_ring_on_pairs_falls_back_quickly() {
-        let n = 16;
+        let t = pairs_on_a_switch(8);
+        let start = std::time::Instant::now();
+        assert!(solve(&t, &laid_out("tp", 15, Layout::Ring)).is_ok());
+        assert!(solve(&t, &laid_out("tp", 16, Layout::Ring)).is_ok());
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// The pairs are parts of two, so the pre-check refuses an odd split
+    /// ring before any search, and an even one still places.
+    #[test]
+    fn an_odd_split_ring_on_pairs_is_refused_without_a_search() {
+        let t = pairs_on_a_switch(8);
+        let groups = t.port_groups();
+        let nodes: Vec<&NodeId> = t.free_gpus.keys().collect();
+        let split = |k: usize| {
+            let mut r = laid_out("tp", k, Layout::Ring);
+            r.sets[0].ports = Ports::Split;
+            r
+        };
+        assert!(split_ring_nodes(&t, &split(15).sets[0], &groups, &nodes).is_none());
+        let start = std::time::Instant::now();
+        assert!(solve(&t, &split(15)).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(
+            split_ring_nodes(&t, &split(6).sets[0], &groups, &nodes).map(|n| n.len()),
+            Some(16)
+        );
+        let s = solve(&t, &split(6)).unwrap();
+        assert!(sides(&s, "tp").iter().all(|(a, b)| a != b));
+    }
+
+    /// A box that loses its cable partner keeps one port group, so a split
+    /// ring leaves it out.
+    #[test]
+    fn a_box_whose_partner_is_busy_sits_out_a_split_ring() {
+        let mut t = pairs_on_a_switch(3);
+        t.free_gpus.insert("n01".into(), 0.0);
+        let mut r = laid_out("tp", 4, Layout::Ring);
+        r.sets[0].ports = Ports::Split;
+        let s = solve(&t, &r).unwrap();
+        assert_eq!(order(&s, "tp"), ["n02", "n03", "n04", "n05"]);
+        r.sets[0].bundles = vec![1.0; 5];
+        assert!(solve(&t, &r).is_err());
+    }
+
+    /// `pairs` cabled pairs, every box also on one switch.
+    fn pairs_on_a_switch(pairs: usize) -> Topology {
+        let n = pairs * 2;
         let mut t = Topology::default();
         for i in 0..n {
             t.ports.insert(
@@ -2326,10 +2504,7 @@ mod tests {
             t.links
                 .insert((format!("10.60.0.{i}"), format!("10.60.0.{}", i + 1)), 0);
         }
-        let start = std::time::Instant::now();
-        assert!(solve(&t, &laid_out("tp", 15, Layout::Ring)).is_ok());
-        assert!(solve(&t, &laid_out("tp", 16, Layout::Ring)).is_ok());
-        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        t
     }
 
     #[test]
