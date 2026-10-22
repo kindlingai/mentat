@@ -70,6 +70,30 @@ impl Layout {
     }
 }
 
+/// Which ports a ring or line member reaches its two neighbours by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ports {
+    /// Split where some ring or line allows it, else any.
+    Auto,
+    /// Different ports for the two neighbours.
+    Split,
+    /// One port for both neighbours.
+    Same,
+}
+
+impl Ports {
+    pub fn parse(s: &str) -> Result<Ports, String> {
+        match s {
+            "auto" | "" => Ok(Ports::Auto),
+            "split" => Ok(Ports::Split),
+            "same" => Ok(Ports::Same),
+            other => Err(format!(
+                "unknown ports {other:?}, expected auto, split or same"
+            )),
+        }
+    }
+}
+
 impl Link {
     pub fn parse(s: &str) -> Result<Link, String> {
         match s {
@@ -122,6 +146,7 @@ pub struct SetReq {
     pub bundles: Vec<f64>,
     pub link: Link,
     pub layout: Layout,
+    pub ports: Ports,
     /// Pins the set to one GPU vendor. Empty lets the daemon pick one, and
     /// it still picks only one: no collective spans vendors.
     pub vendor: String,
@@ -198,12 +223,19 @@ impl Topology {
 
     /// The best link between two nodes meeting `link`, or None. With
     /// `cable`, a forwarded pair does not count.
+    fn path(&self, a: &NodeId, b: &NodeId, link: Link, cable: bool) -> Option<Path> {
+        self.paths(a, b, link, cable).into_iter().next()
+    }
+
+    /// Every link between two nodes meeting `link`, best first.
     ///
     /// Ranked by round trip, then by address, so a tie resolves the same way
-    /// on every daemon. Ports are the node's own order otherwise.
-    fn path(&self, a: &NodeId, b: &NodeId, link: Link, cable: bool) -> Option<Path> {
-        let (pa, pb) = (self.ports.get(a)?, self.ports.get(b)?);
-        let mut best: Option<Path> = None;
+    /// on every daemon.
+    fn paths(&self, a: &NodeId, b: &NodeId, link: Link, cable: bool) -> Vec<Path> {
+        let (Some(pa), Some(pb)) = (self.ports.get(a), self.ports.get(b)) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
         for x in pa {
             for y in pb {
                 if link == Link::Rdma && !(x.rdma() && y.rdma()) {
@@ -215,26 +247,53 @@ impl Topology {
                 if cable && self.is_forwarded(&x.addr, &y.addr) {
                     continue;
                 }
-                let cand = Path {
+                out.push(Path {
                     from: a.clone(),
                     to: b.clone(),
                     local: x.clone(),
                     remote: y.clone(),
                     rtt_ms: rtt,
-                };
-                let better = match &best {
-                    None => true,
-                    Some(b0) => {
-                        (cand.rtt_ms, &cand.local.addr, &cand.remote.addr)
-                            < (b0.rtt_ms, &b0.local.addr, &b0.remote.addr)
-                    }
-                };
-                if better {
-                    best = Some(cand);
-                }
+                });
             }
         }
-        best
+        out.sort_by(|p, q| {
+            (p.rtt_ms, &p.local.addr, &p.remote.addr).cmp(&(
+                q.rtt_ms,
+                &q.local.addr,
+                &q.remote.addr,
+            ))
+        });
+        out
+    }
+
+    /// Each address to the lowest address of its node that reaches the same
+    /// far addresses over cables. A ring treats two such addresses as one
+    /// port. A DGX Spark shows each QSFP port as two interfaces on one wire.
+    /// Each interface reaches both of the far box's, so the two share an
+    /// entry. Two cables to one box reach different far addresses and keep
+    /// two entries.
+    fn port_groups(&self) -> BTreeMap<String, String> {
+        let mut reach: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (a, b) in self.links.keys() {
+            if !self.is_forwarded(a, b) {
+                reach.entry(a).or_default().insert(b);
+                reach.entry(b).or_default().insert(a);
+            }
+        }
+        let mut out = BTreeMap::new();
+        for ps in self.ports.values() {
+            for p in ps {
+                let mine = reach.get(p.addr.as_str());
+                let first = ps
+                    .iter()
+                    .map(|q| &q.addr)
+                    .filter(|q| reach.get(q.as_str()) == mine)
+                    .min()
+                    .unwrap_or(&p.addr);
+                out.insert(p.addr.clone(), first.clone());
+            }
+        }
+        out
     }
 }
 
@@ -249,6 +308,16 @@ pub struct Path {
 }
 
 impl Path {
+    fn reversed(&self) -> Path {
+        Path {
+            from: self.to.clone(),
+            to: self.from.clone(),
+            local: self.remote.clone(),
+            remote: self.local.clone(),
+            rtt_ms: self.rtt_ms,
+        }
+    }
+
     /// Each end names its set, so a reader with three sets can tell which
     /// `between` showed which request without recomputing the solve.
     fn to_json(&self, hosts: &BTreeMap<NodeId, String>, sets: &BTreeMap<NodeId, String>) -> Value {
@@ -352,25 +421,66 @@ impl Solution {
     }
 }
 
+/// One placement of a set: its nodes in order, and for a ring or a line
+/// the link from each member to the next. A ring's last link closes it.
+#[derive(Clone, Debug, PartialEq)]
+struct Cand {
+    nodes: Vec<NodeId>,
+    links: Vec<Path>,
+}
+
 /// Candidate node groups for a set, best first.
 ///
 /// An `rdma` set may only sit inside an island, since that is the derived
 /// answer to "these nodes are cabled together and every pair was probed". An
 /// `any` set uses nodes in id order, which is arbitrary but identical on
 /// every daemon.
+///
+/// A ring or a line under `Ports::Auto` lists the answers that split every
+/// member's two links across ports first. Four boxes on a switch and cabled
+/// in pairs then ring over the cables and the switch in turn, with each box
+/// using both ports.
 fn candidates(
     t: &Topology,
     set: &SetReq,
+    groups: &BTreeMap<String, String>,
     taken: &BTreeSet<NodeId>,
     driver: Option<&NodeId>,
-) -> Vec<Vec<NodeId>> {
+) -> Vec<Cand> {
     if set.layout.ordered() {
         let nodes: Vec<&NodeId> = t.free_gpus.keys().filter(|n| !taken.contains(*n)).collect();
-        let mut out = Vec::new();
         if set.layout == Layout::Star {
+            let mut out = Vec::new();
             stars(t, set, &nodes, driver, &mut out);
-        } else {
-            walk(t, set, &nodes, &mut Vec::new(), &mut out);
+            return out
+                .into_iter()
+                .map(|nodes| Cand {
+                    nodes,
+                    links: Vec::new(),
+                })
+                .collect();
+        }
+        let rules: &[Rule] = match set.ports {
+            Ports::Auto => &[Rule::Split, Rule::Any],
+            Ports::Split => &[Rule::Split],
+            Ports::Same => &[Rule::Same],
+        };
+        let mut out = Vec::new();
+        for &rule in rules {
+            let mut found = Vec::new();
+            let w = Walk {
+                t,
+                set,
+                groups,
+                rule,
+                steps: std::cell::Cell::new(0),
+            };
+            w.walk(&nodes, &mut Vec::new(), Vec::new(), &mut found);
+            for c in found {
+                if !out.contains(&c) {
+                    out.push(c);
+                }
+            }
         }
         return out;
     }
@@ -407,7 +517,12 @@ fn candidates(
                     out.push(chosen);
                 }
             }
-            out
+            out.into_iter()
+                .map(|nodes| Cand {
+                    nodes,
+                    links: Vec::new(),
+                })
+                .collect()
         }
         Link::Any => {
             let mut chosen: Vec<NodeId> = Vec::new();
@@ -420,7 +535,10 @@ fn candidates(
                 }
             }
             if chosen.len() == want {
-                vec![chosen]
+                vec![Cand {
+                    nodes: chosen,
+                    links: Vec::new(),
+                }]
             } else {
                 Vec::new()
             }
@@ -433,48 +551,191 @@ fn candidates(
 /// has many more.
 const MAX_CHAINS: usize = 32;
 
-/// Collect into `out` the node orders for a ring or line set that extend
-/// `chain`: each member links to the next over a cable, and a ring's last
-/// member links to its first.
-///
-/// A ring starts at its lowest node id, so each ring is found once per
-/// direction. Placement rotates it to the driver's node.
-fn walk<'a>(
-    t: &Topology,
-    set: &SetReq,
-    nodes: &[&'a NodeId],
-    chain: &mut Vec<&'a NodeId>,
-    out: &mut Vec<Vec<NodeId>>,
-) {
-    let want = set.bundles.len();
-    if out.len() >= MAX_CHAINS {
-        return;
+/// A partial ring or line. `leaves` is the port group at the start of its
+/// first link, and `arrives` the port group at the end of its last link.
+struct Trail {
+    leaves: String,
+    arrives: String,
+    links: Vec<Path>,
+}
+
+/// What a ring or line search asks of each member's two links.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rule {
+    /// Different port groups.
+    Split,
+    /// One port group.
+    Same,
+    /// The best link for each step, whatever its port.
+    Any,
+}
+
+/// A ring or line search gives up after visiting this many partial
+/// chains. Some requests have no answer and a search space that grows with
+/// the factorial of the cluster: a split ring of odd size on boxes cabled in
+/// pairs visits every order. The head solves a claim holding its state lock.
+const MAX_STEPS: usize = 20_000;
+
+/// A ring or line search under one `Rule`.
+struct Walk<'t> {
+    t: &'t Topology,
+    set: &'t SetReq,
+    groups: &'t BTreeMap<String, String>,
+    rule: Rule,
+    steps: std::cell::Cell<usize>,
+}
+
+impl Walk<'_> {
+    /// Whether a member may reach its neighbours by these two port groups.
+    fn allows(&self, a: &str, b: &str) -> bool {
+        match self.rule {
+            Rule::Split => a != b,
+            Rule::Same => a == b,
+            Rule::Any => true,
+        }
     }
-    if chain.len() == want {
-        let closed = set.layout != Layout::Ring
-            || want < 3
-            || t.path(chain[want - 1], chain[0], set.link, true).is_some();
-        if closed {
-            out.push(chain.iter().map(|n| (*n).clone()).collect());
-        }
-        return;
+
+    fn group(&self, p: &Port) -> String {
+        self.groups
+            .get(&p.addr)
+            .cloned()
+            .unwrap_or_else(|| p.addr.clone())
     }
-    let i = chain.len();
-    for &n in nodes {
-        if chain.contains(&n) || t.free_gpus.get(n).copied().unwrap_or(0.0) < set.bundles[i] {
-            continue;
+
+    /// The links worth trying from `a` to `b`: under `Rule::Any` the best
+    /// one, else the best per pair of port groups.
+    fn options(&self, a: &NodeId, b: &NodeId) -> Vec<Path> {
+        let all = self.t.paths(a, b, self.set.link, true);
+        if self.rule == Rule::Any {
+            return all.into_iter().take(1).collect();
         }
-        if set.layout == Layout::Ring && chain.first().is_some_and(|first| n < *first) {
-            continue;
-        }
-        if let Some(last) = chain.last() {
-            if t.path(last, n, set.link, true).is_none() {
-                continue;
+        let mut seen = BTreeSet::new();
+        all.into_iter()
+            .filter(|p| seen.insert((self.group(&p.local), self.group(&p.remote))))
+            .collect()
+    }
+
+    /// Each trail extended by a link from `last` to `n`, one per distinct
+    /// pair of end groups. An empty `trails` means `last` is the first
+    /// member.
+    fn extend(&self, last: &NodeId, n: &NodeId, trails: &[Trail]) -> Vec<Trail> {
+        let options = self.options(last, n);
+        let mut out: Vec<Trail> = Vec::new();
+        let mut add = |leaves: String, p: &Path, before: &[Path]| {
+            let arrives = self.group(&p.remote);
+            if out
+                .iter()
+                .any(|o| o.leaves == leaves && o.arrives == arrives)
+            {
+                return;
+            }
+            let mut links = before.to_vec();
+            links.push(p.clone());
+            out.push(Trail {
+                leaves,
+                arrives,
+                links,
+            });
+        };
+        if trails.is_empty() {
+            for p in &options {
+                add(self.group(&p.local), p, &[]);
             }
         }
-        chain.push(n);
-        walk(t, set, nodes, chain, out);
-        chain.pop();
+        for tr in trails {
+            for p in &options {
+                if !self.allows(&tr.arrives, &self.group(&p.local)) {
+                    continue;
+                }
+                add(tr.leaves.clone(), p, &tr.links);
+            }
+        }
+        out
+    }
+
+    /// The links of a full chain: a line's as they are, a ring's with a
+    /// link from the last member back to the first.
+    fn finish(&self, chain: &[&NodeId], trails: &[Trail]) -> Option<Vec<Path>> {
+        let k = chain.len();
+        if k == 1 {
+            return Some(Vec::new());
+        }
+        if self.set.layout != Layout::Ring {
+            return trails.first().map(|tr| tr.links.clone());
+        }
+        // Two members on one link are a ring.
+        if k == 2 && self.rule == Rule::Any {
+            let tr = trails.first()?;
+            return Some(vec![tr.links[0].clone(), tr.links[0].reversed()]);
+        }
+        let options = self.options(chain[k - 1], chain[0]);
+        for tr in trails {
+            for p in &options {
+                if !self.allows(&tr.arrives, &self.group(&p.local))
+                    || !self.allows(&self.group(&p.remote), &tr.leaves)
+                {
+                    continue;
+                }
+                let mut links = tr.links.clone();
+                links.push(p.clone());
+                return Some(links);
+            }
+        }
+        None
+    }
+
+    /// Collect into `out` the rings or lines that extend `chain`: each
+    /// member links to the next over a cable, and a ring's last member links
+    /// to its first.
+    ///
+    /// A ring starts at its lowest node id, so each ring is found once per
+    /// direction. Placement rotates it to the driver's node.
+    fn walk<'a>(
+        &self,
+        nodes: &[&'a NodeId],
+        chain: &mut Vec<&'a NodeId>,
+        trails: Vec<Trail>,
+        out: &mut Vec<Cand>,
+    ) {
+        let set = self.set;
+        let want = set.bundles.len();
+        if out.len() >= MAX_CHAINS || self.steps.get() >= MAX_STEPS {
+            return;
+        }
+        self.steps.set(self.steps.get() + 1);
+        if chain.len() == want {
+            if let Some(links) = self.finish(chain, &trails) {
+                out.push(Cand {
+                    nodes: chain.iter().map(|n| (*n).clone()).collect(),
+                    links,
+                });
+            }
+            return;
+        }
+        let i = chain.len();
+        for &n in nodes {
+            if chain.contains(&n)
+                || self.t.free_gpus.get(n).copied().unwrap_or(0.0) < set.bundles[i]
+            {
+                continue;
+            }
+            if set.layout == Layout::Ring && chain.first().is_some_and(|first| n < *first) {
+                continue;
+            }
+            let next = match chain.last() {
+                Some(last) => {
+                    let next = self.extend(last, n, &trails);
+                    if next.is_empty() {
+                        continue;
+                    }
+                    next
+                }
+                None => Vec::new(),
+            };
+            chain.push(n);
+            self.walk(nodes, chain, next, out);
+            chain.pop();
+        }
     }
 }
 
@@ -532,34 +793,6 @@ fn spokes<'a>(
         spokes(t, set, leaves, chain, out);
         chain.pop();
     }
-}
-
-/// The links from member `i` to the members before and after it.
-fn neighbours(
-    t: &Topology,
-    set: &SetReq,
-    nodes: &[NodeId],
-    i: usize,
-) -> Result<(Option<Path>, Option<Path>), String> {
-    let k = nodes.len();
-    let (prev, next) = match set.layout {
-        Layout::Mesh | Layout::Star => (None, None),
-        Layout::Ring if k > 1 => (Some((i + k - 1) % k), Some((i + 1) % k)),
-        Layout::Ring => (None, None),
-        Layout::Line => ((i > 0).then(|| i - 1), (i + 1 < k).then_some(i + 1)),
-    };
-    let link = |j: Option<usize>| {
-        j.map(|j| {
-            t.path(&nodes[i], &nodes[j], set.link, true).ok_or_else(|| {
-                format!(
-                    "{} has no cable to {} in set {:?}",
-                    nodes[i], nodes[j], set.name
-                )
-            })
-        })
-        .transpose()
-    };
-    Ok((link(prev)?, link(next)?))
 }
 
 /// In a star, a leaf's link to the hub, or the hub's link to each leaf.
@@ -639,18 +872,30 @@ pub fn solve(t: &Topology, req: &Request) -> Result<Solution, String> {
     let mut order: Vec<&SetReq> = req.sets.iter().collect();
     order.sort_by_key(|s| (s.link != Link::Rdma, s.name.clone()));
 
-    let mut chosen: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
+    let groups = t.port_groups();
+    let mut chosen: BTreeMap<String, Cand> = BTreeMap::new();
     let mut taken: BTreeSet<NodeId> = BTreeSet::new();
-    if !search(t, req, &order, 0, &mut chosen, &mut taken) {
+    if !search(t, req, &groups, &order, 0, &mut chosen, &mut taken) {
         return Err(why_not(t, req));
     }
 
     let mut sets: BTreeMap<String, Vec<Member>> = BTreeMap::new();
     for s in &req.sets {
-        let nodes = &chosen[&s.name];
+        let Cand { nodes, links } = &chosen[&s.name];
+        let k = nodes.len();
         let mut members = Vec::new();
         for (i, n) in nodes.iter().enumerate() {
-            let (prev, next) = neighbours(t, s, nodes, i)?;
+            let (prev, next) = match s.layout {
+                Layout::Ring if k > 1 => (
+                    Some(links[(i + k - 1) % k].reversed()),
+                    Some(links[i].clone()),
+                ),
+                Layout::Line => (
+                    (i > 0).then(|| links[i - 1].reversed()),
+                    links.get(i).cloned(),
+                ),
+                _ => (None, None),
+            };
             let (hub, leaves) = star_links(t, s, nodes, i)?;
             // A ring or line member binds the port toward its next member,
             // and a line's last member the port toward its previous one. A
@@ -686,25 +931,27 @@ pub fn solve(t: &Topology, req: &Request) -> Result<Solution, String> {
 fn search(
     t: &Topology,
     req: &Request,
+    groups: &BTreeMap<String, String>,
     order: &[&SetReq],
     i: usize,
-    chosen: &mut BTreeMap<String, Vec<NodeId>>,
+    chosen: &mut BTreeMap<String, Cand>,
     taken: &mut BTreeSet<NodeId>,
 ) -> bool {
     if i == order.len() {
         return paths_between(t, req, chosen).is_some();
     }
     let set = order[i];
-    for cand in candidates(t, set, taken, req.driver.as_ref()) {
-        for n in &cand {
+    for cand in candidates(t, set, groups, taken, req.driver.as_ref()) {
+        for n in &cand.nodes {
             taken.insert(n.clone());
         }
-        chosen.insert(set.name.clone(), cand.clone());
-        if search(t, req, order, i + 1, chosen, taken) {
+        let nodes = cand.nodes.clone();
+        chosen.insert(set.name.clone(), cand);
+        if search(t, req, groups, order, i + 1, chosen, taken) {
             return true;
         }
         chosen.remove(&set.name);
-        for n in &cand {
+        for n in &nodes {
             taken.remove(n);
         }
     }
@@ -718,11 +965,11 @@ fn search(
 fn paths_between(
     t: &Topology,
     req: &Request,
-    chosen: &BTreeMap<String, Vec<NodeId>>,
+    chosen: &BTreeMap<String, Cand>,
 ) -> Option<Vec<Path>> {
     let mut out = Vec::new();
     for b in &req.between {
-        let (from, to) = (chosen.get(&b.from)?, chosen.get(&b.to)?);
+        let (from, to) = (&chosen.get(&b.from)?.nodes, &chosen.get(&b.to)?.nodes);
         let mut best: Option<Path> = None;
         for a in from {
             for c in to {
@@ -748,15 +995,22 @@ fn why_not(t: &Topology, req: &Request) -> String {
     for s in &req.sets {
         let want = s.bundles.len();
         if s.layout.ordered() {
-            let how = if s.layout == Layout::Star {
-                "a hub cabled to each of the others"
-            } else {
-                "each cabled to the next"
+            let how = match (s.layout, s.ports) {
+                (Layout::Star, _) => "a hub cabled to each of the others",
+                (_, Ports::Split) => {
+                    "each cabled to the next and reaching its two neighbours by different ports"
+                }
+                (_, Ports::Same) => {
+                    "each cabled to the next and reaching its two neighbours by one port"
+                }
+                _ => "each cabled to the next",
             };
+            // The search stops at MAX_STEPS. A ring or line it did not
+            // reach may still exist.
             let order = if s.layout == Layout::Star {
                 "no free node has enough free neighbours"
             } else {
-                "no such order of free nodes exists"
+                "no such order of free nodes was found"
             };
             parts.push(format!(
                 "set {:?} wants a {} of {want} nodes, {how} over {} links, and {order}",
@@ -827,11 +1081,17 @@ pub fn parse(shape: &Value) -> Result<Request, String> {
                 Value::Number(n) => vec![1.0; n.as_u64().unwrap_or(0) as usize],
                 _ => return Err(format!("set {name:?} needs bundles")),
             };
+            let layout = Layout::parse(s["layout"].as_str().unwrap_or("mesh"))?;
+            let ports = Ports::parse(s["ports"].as_str().unwrap_or("auto"))?;
+            if ports != Ports::Auto && !matches!(layout, Layout::Ring | Layout::Line) {
+                return Err(format!("set {name:?}: ports applies to a ring or a line"));
+            }
             Ok(SetReq {
                 name,
                 bundles,
                 link: Link::parse(s["link"].as_str().unwrap_or("ip"))?,
-                layout: Layout::parse(s["layout"].as_str().unwrap_or("mesh"))?,
+                layout,
+                ports,
                 vendor: s["vendor"].as_str().unwrap_or_default().to_string(),
             })
         })
@@ -1065,6 +1325,7 @@ mod tests {
                     bundles: vec![1.0; *k],
                     link: *l,
                     layout: Layout::Mesh,
+                    ports: Ports::Auto,
                     vendor: String::new(),
                 })
                 .collect(),
@@ -1319,8 +1580,155 @@ mod tests {
             .insert(("10.100.1.1".into(), "10.100.2.2".into()));
         assert!(solve(&t, &laid_out("tp", 3, Layout::Ring)).is_err());
         t.forwarded.clear();
+        // A, B, C would take C's links to B and to A on one port. A, C, D
+        // uses two ports on every member.
         let s = solve(&t, &laid_out("tp", 3, Layout::Ring)).unwrap();
-        assert_eq!(order(&s, "tp"), ["nA", "nB", "nC"]);
+        assert_eq!(order(&s, "tp"), ["nA", "nC", "nD"]);
+    }
+
+    /// Four boxes with their first port on one switch, and n0-n1 and n2-n3
+    /// cabled on their second ports. With `halves`, each port shows two
+    /// interfaces on one wire, as a DGX Spark's does, each in its own
+    /// subnet.
+    fn switch_and_pairs(halves: bool) -> Topology {
+        let mut t = Topology::default();
+        let addrs = |i: usize, wire: &str| -> Vec<String> {
+            let mut v = vec![format!("10.{wire}.0.{i}")];
+            if halves {
+                v.push(format!("10.{wire}.1.{i}"));
+            }
+            v
+        };
+        for i in 0..4 {
+            let mut ports = Vec::new();
+            for (wire, iface) in [("50", "sw"), ("60", "pair")] {
+                for (h, a) in addrs(i, wire).iter().enumerate() {
+                    ports.push(port(a, &format!("{iface}{h}"), &["rdma"]));
+                }
+            }
+            t.ports.insert(format!("n{i}"), ports);
+            t.free_gpus.insert(format!("n{i}"), 1.0);
+        }
+        let mut link = |a: &str, b: &str| {
+            t.links.insert((a.to_string(), b.to_string()), 0);
+        };
+        for i in 0..4 {
+            for j in i + 1..4 {
+                for a in addrs(i, "50") {
+                    for b in addrs(j, "50") {
+                        link(&a, &b);
+                    }
+                }
+            }
+        }
+        for (i, j) in [(0, 1), (2, 3)] {
+            for a in addrs(i, "60") {
+                for b in addrs(j, "60") {
+                    link(&a, &b);
+                }
+            }
+        }
+        t
+    }
+
+    /// The port each member reaches its previous and next member by.
+    fn sides(s: &Solution, set: &str) -> Vec<(String, String)> {
+        let wire = |p: &Option<Path>| {
+            let a = &p.as_ref().unwrap().local.addr;
+            a.split('.').nth(1).unwrap().to_string()
+        };
+        s.sets[set]
+            .iter()
+            .map(|m| (wire(&m.prev), wire(&m.next)))
+            .collect()
+    }
+
+    /// The case this exists for: each box rings over the switch on one side
+    /// and its cable on the other, so every box uses both ports.
+    #[test]
+    fn a_ring_on_a_switch_and_pairs_uses_both_ports() {
+        for halves in [false, true] {
+            let t = switch_and_pairs(halves);
+            let s = solve(&t, &laid_out("tp", 4, Layout::Ring)).unwrap();
+            assert_eq!(order(&s, "tp"), ["n0", "n1", "n2", "n3"], "halves {halves}");
+            let want: Vec<(String, String)> = [("50", "60"), ("60", "50")]
+                .repeat(2)
+                .into_iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect();
+            assert_eq!(sides(&s, "tp"), want, "halves {halves}");
+        }
+    }
+
+    /// Two boxes joined by two cables ring over both.
+    #[test]
+    fn two_cables_make_a_ring_of_two_on_both() {
+        let mut t = Topology::default();
+        for (n, i) in [("nA", 1), ("nB", 2)] {
+            t.ports.insert(
+                n.into(),
+                vec![
+                    port(&format!("10.70.0.{i}"), "p0", &["rdma"]),
+                    port(&format!("10.71.0.{i}"), "p1", &["rdma"]),
+                ],
+            );
+            t.free_gpus.insert(n.into(), 1.0);
+        }
+        t.links.insert(("10.70.0.1".into(), "10.70.0.2".into()), 0);
+        t.links.insert(("10.71.0.1".into(), "10.71.0.2".into()), 0);
+        let s = solve(&t, &laid_out("tp", 2, Layout::Ring)).unwrap();
+        let sides = sides(&s, "tp");
+        assert_ne!(sides[0].0, sides[0].1, "{sides:?}");
+        assert_ne!(sides[1].0, sides[1].1, "{sides:?}");
+    }
+
+    /// The first member sends its first link from one port and must take
+    /// the closing link on the other. nA's port 10.80 reaches
+    /// both of nB's ports and sorts first, so leaving by it and closing over
+    /// it is found first.
+    #[test]
+    fn a_ring_closes_on_the_first_members_other_port() {
+        let mut t = Topology::default();
+        t.ports.insert(
+            "nA".into(),
+            vec![
+                port("10.80.0.1", "p0", &["rdma"]),
+                port("10.90.0.1", "p1", &["rdma"]),
+            ],
+        );
+        t.ports.insert(
+            "nB".into(),
+            vec![
+                port("10.80.0.2", "p0", &["rdma"]),
+                port("10.81.0.2", "p1", &["rdma"]),
+            ],
+        );
+        for n in ["nA", "nB"] {
+            t.free_gpus.insert(n.into(), 1.0);
+        }
+        for (a, b) in [
+            ("10.80.0.1", "10.80.0.2"),
+            ("10.80.0.1", "10.81.0.2"),
+            ("10.90.0.1", "10.80.0.2"),
+        ] {
+            t.links.insert((a.into(), b.into()), 0);
+        }
+        let s = solve(&t, &laid_out("tp", 2, Layout::Ring)).unwrap();
+        let m = &s.sets["tp"];
+        for x in m {
+            let (p, q) = (x.prev.as_ref().unwrap(), x.next.as_ref().unwrap());
+            assert_ne!(p.local.addr, q.local.addr, "{m:?}");
+        }
+    }
+
+    /// Boxes with one port each still ring, over the one port.
+    #[test]
+    fn a_ring_on_one_switch_shares_the_port() {
+        let mut t = switch_and_pairs(false);
+        t.links.retain(|(a, _), _| a.starts_with("10.50."));
+        let s = solve(&t, &laid_out("tp", 4, Layout::Ring)).unwrap();
+        assert_eq!(order(&s, "tp"), ["n0", "n1", "n2", "n3"]);
+        assert!(sides(&s, "tp").iter().all(|(a, b)| a == "50" && b == "50"));
     }
 
     /// A mesh holds every ring, so a ring request on a cabled pair works.
@@ -1589,6 +1997,11 @@ mod tests {
                         Vec::new()
                     };
                     assert_eq!(leaves, want, "{order:?}");
+                    // Both ends of a link name the same cable.
+                    if let Some(p) = &m.next {
+                        let back = sol.sets["s"][(i + 1) % k].prev.as_ref().unwrap();
+                        assert_eq!(*back, p.reversed(), "{order:?}");
+                    }
                     let toward = m.next.as_ref().or(m.prev.as_ref()).or(m.hub.as_ref());
                     if let Some(p) = toward.or(m.leaves.first()) {
                         assert_eq!(m.bind, p.local, "{order:?}");
@@ -1671,6 +2084,273 @@ mod tests {
         for code in 0..3u32.pow(m) {
             check_every_request(&graph(n, |k| (code / 3u32.pow(k as u32) % 3) as u8), n);
         }
+    }
+
+    /// A small deterministic generator, so the random graphs are the same on
+    /// every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    /// `n` nodes with two ports each. Each port is on a switch, cabled to a
+    /// port of another node, or unused.
+    fn two_port_graph(n: usize, rng: &mut Rng) -> Topology {
+        let mut t = Topology::default();
+        let addr = |i: usize, p: usize| format!("10.0.{p}.{i}");
+        for i in 0..n {
+            t.ports.insert(
+                format!("n{i}"),
+                (0..2).map(|p| port(&addr(i, p), "p", &["rdma"])).collect(),
+            );
+            t.free_gpus.insert(format!("n{i}"), 1.0);
+        }
+        let mut switch = Vec::new();
+        let mut loose = Vec::new();
+        for i in 0..n {
+            for p in 0..2 {
+                match rng.below(3) {
+                    0 => switch.push((i, p)),
+                    1 => loose.push((i, p)),
+                    _ => {}
+                }
+            }
+        }
+        for (x, a) in switch.iter().enumerate() {
+            for b in &switch[x + 1..] {
+                if a.0 != b.0 {
+                    t.links.insert((addr(a.0, a.1), addr(b.0, b.1)), 0);
+                }
+            }
+        }
+        while loose.len() >= 2 {
+            let a = loose.remove(rng.below(loose.len() as u64) as usize);
+            let b = loose.remove(rng.below(loose.len() as u64) as usize);
+            if a.0 != b.0 {
+                t.links.insert((addr(a.0, a.1), addr(b.0, b.1)), 0);
+            }
+        }
+        t
+    }
+
+    /// The addresses `a` has a link to, read from the tables directly.
+    fn far(t: &Topology, a: &str) -> BTreeSet<String> {
+        t.links
+            .keys()
+            .filter_map(|(x, y)| {
+                if x == a {
+                    Some(y.clone())
+                } else if y == a {
+                    Some(x.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Whether some choice of links puts `order` on a ring or a line in
+    /// which every member reaches its two neighbours by different ports.
+    /// Two ports differ when they reach different far addresses, read from the
+    /// tables directly.
+    fn splits(t: &Topology, layout: Layout, order: &[String]) -> bool {
+        holds(t, layout, order, Ports::Split)
+    }
+
+    /// Whether some choice of links puts `order` on a ring or a line in
+    /// which every member's two links meet `ports`.
+    fn holds(t: &Topology, layout: Layout, order: &[String], ports: Ports) -> bool {
+        let reach = |a: &str| far(t, a);
+        let links = |a: &str, b: &str| -> Vec<(String, String)> {
+            let mut v = Vec::new();
+            for x in &t.ports[a] {
+                for y in &t.ports[b] {
+                    let k = (x.addr.clone(), y.addr.clone());
+                    let r = (y.addr.clone(), x.addr.clone());
+                    if t.links.contains_key(&k) || t.links.contains_key(&r) {
+                        v.push(k);
+                    }
+                }
+            }
+            v
+        };
+        let k = order.len();
+        let steps = if layout == Layout::Ring && k > 1 {
+            k
+        } else {
+            k - 1
+        };
+        let options: Vec<Vec<(String, String)>> = (0..steps)
+            .map(|i| links(&order[i], &order[(i + 1) % k]))
+            .collect();
+        type Check<'c> = &'c dyn Fn(&[(String, String)]) -> bool;
+        fn pick(
+            options: &[Vec<(String, String)>],
+            got: &mut Vec<(String, String)>,
+            ok: Check,
+        ) -> bool {
+            if got.len() == options.len() {
+                return ok(got);
+            }
+            for o in &options[got.len()] {
+                got.push(o.clone());
+                if pick(options, got, ok) {
+                    return true;
+                }
+                got.pop();
+            }
+            false
+        }
+        let ok = |got: &[(String, String)]| {
+            (0..k).all(|i| {
+                let into = if i > 0 {
+                    Some(&got[i - 1].1)
+                } else if layout == Layout::Ring && k > 1 {
+                    Some(&got[k - 1].1)
+                } else {
+                    None
+                };
+                let out = got.get(i).map(|l| &l.0);
+                match (into, out) {
+                    (Some(a), Some(b)) => (reach(a) == reach(b)) == (ports == Ports::Same),
+                    _ => true,
+                }
+            })
+        };
+        pick(&options, &mut Vec::new(), &ok)
+    }
+
+    /// Random two-port graphs: whenever some ring or line has every member
+    /// on different ports to its two neighbours, the answer is one.
+    #[test]
+    fn a_ring_or_line_uses_both_ports_whenever_one_can() {
+        let mut rng = Rng(0x9e3779b97f4a7c15);
+        let n = 4;
+        for _ in 0..400 {
+            let t = two_port_graph(n, &mut rng);
+            for layout in [Layout::Ring, Layout::Line] {
+                for k in 2..=n {
+                    let want = orders(n, k).iter().any(|o| splits(&t, layout, o));
+                    let Ok(s) = solve(&t, &laid_out("s", k, layout)) else {
+                        assert!(!want, "{layout:?} of {k} on {:?}", t.links);
+                        continue;
+                    };
+                    let got = s.sets["s"].iter().all(|m| match (&m.prev, &m.next) {
+                        (Some(p), Some(q)) => far(&t, &p.local.addr) != far(&t, &q.local.addr),
+                        _ => true,
+                    });
+                    assert_eq!(got, want, "{layout:?} of {k} on {:?}", t.links);
+                }
+            }
+        }
+    }
+
+    /// Under `split` or `same`, a ring or line exists exactly when one meets
+    /// the rule, and the answer meets it.
+    #[test]
+    fn a_ports_rule_is_met_or_refused() {
+        let mut rng = Rng(0x2545f4914f6cdd1d);
+        let n = 4;
+        for _ in 0..300 {
+            let t = two_port_graph(n, &mut rng);
+            for ports in [Ports::Split, Ports::Same] {
+                for layout in [Layout::Ring, Layout::Line] {
+                    for k in 2..=n {
+                        let want = orders(n, k).iter().any(|o| holds(&t, layout, o, ports));
+                        let mut r = laid_out("s", k, layout);
+                        r.sets[0].ports = ports;
+                        let got = solve(&t, &r);
+                        let at = format!("{ports:?} {layout:?} of {k} on {:?}", t.links);
+                        assert_eq!(got.is_ok(), want, "{at}");
+                        let Ok(s) = got else { continue };
+                        for m in &s.sets["s"] {
+                            if let (Some(p), Some(q)) = (&m.prev, &m.next) {
+                                let same = far(&t, &p.local.addr) == far(&t, &q.local.addr);
+                                assert_eq!(same, ports == Ports::Same, "{at}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn same_keeps_each_ring_member_on_one_port() {
+        let t = switch_and_pairs(true);
+        let mut r = laid_out("tp", 4, Layout::Ring);
+        r.sets[0].ports = Ports::Same;
+        let s = solve(&t, &r).unwrap();
+        assert!(sides(&s, "tp").iter().all(|(a, b)| a == "50" && b == "50"));
+
+        r.sets[0].ports = Ports::Split;
+        let s = solve(&t, &r).unwrap();
+        assert!(sides(&s, "tp").iter().all(|(a, b)| a != b));
+        // A ring of three leaves one box's cable partner out.
+        let mut r = laid_out("tp", 3, Layout::Ring);
+        r.sets[0].ports = Ports::Split;
+        let e = solve(&t, &r).unwrap_err();
+        assert!(e.contains("different ports"), "{e}");
+    }
+
+    /// Eight pairs on a switch have no split ring of fifteen, since a
+    /// split ring alternates cables and the switch. The split search used to
+    /// visit every order, for over a minute, before `auto` fell back.
+    #[test]
+    fn an_odd_ring_on_pairs_falls_back_quickly() {
+        let n = 16;
+        let mut t = Topology::default();
+        for i in 0..n {
+            t.ports.insert(
+                format!("n{i:02}"),
+                vec![
+                    port(&format!("10.50.0.{i}"), "sw", &["rdma"]),
+                    port(&format!("10.60.0.{i}"), "pair", &["rdma"]),
+                ],
+            );
+            t.free_gpus.insert(format!("n{i:02}"), 1.0);
+        }
+        for i in 0..n {
+            for j in i + 1..n {
+                t.links
+                    .insert((format!("10.50.0.{i}"), format!("10.50.0.{j}")), 0);
+            }
+        }
+        for i in (0..n).step_by(2) {
+            t.links
+                .insert((format!("10.60.0.{i}"), format!("10.60.0.{}", i + 1)), 0);
+        }
+        let start = std::time::Instant::now();
+        assert!(solve(&t, &laid_out("tp", 15, Layout::Ring)).is_ok());
+        assert!(solve(&t, &laid_out("tp", 16, Layout::Ring)).is_ok());
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn ports_names() {
+        let shape = |layout: &str, ports: &str| json!({"sets": [{"name": "tp", "bundles": 2, "layout": layout, "ports": ports}]});
+        assert_eq!(
+            parse(&shape("ring", "split")).unwrap().sets[0].ports,
+            Ports::Split
+        );
+        assert_eq!(
+            parse(&shape("line", "same")).unwrap().sets[0].ports,
+            Ports::Same
+        );
+        assert_eq!(
+            parse(&shape("mesh", "auto")).unwrap().sets[0].ports,
+            Ports::Auto
+        );
+        assert!(parse(&shape("star", "split"))
+            .unwrap_err()
+            .contains("ring or a line"));
+        assert!(parse(&shape("ring", "both")).is_err());
     }
 
     #[test]

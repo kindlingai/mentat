@@ -499,6 +499,20 @@ driver's node when that node can be one. A driver on an inner node of a line,
 or on a star's leaf, leaves the group PENDING. Each rank gets its neighbours'
 addresses, listed under "Actor process".
 
+A ring or line member with two ports can reach its two neighbours on
+different ports. Four boxes with their first port on a switch, and cabled in
+pairs on their second ports, then ring over a cable and the switch in turn,
+and every box uses both ports. A DGX Spark shows each QSFP port as two
+interfaces, and the two count as one port. A set's `ports` picks the rule:
+
+| `ports` | Each member reaches its two neighbours |
+| --- | --- |
+| `auto` (the default) | On different ports where some ring or line allows it, else by the best link to each |
+| `split` | On different ports, or the claim is refused |
+| `same` | On one port, or the claim is refused |
+
+`MENTAT_CLAIM_PORTS` sets it without writing a shape.
+
 ## Environment
 
 An unset or empty variable uses its default. An unparsable `*_MS` value
@@ -757,6 +771,11 @@ The shape to claim, as JSON. Invalid JSON raises at
 The layout of the default shape's set: `mesh`, `ring`, `line` or `star`. Ignored
 when `MENTAT_CLAIM_SHAPE` is set, since that shape names its own. See
 "Claims".
+
+- `MENTAT_CLAIM_PORTS` (default: `auto`)
+
+The default shape's `ports`: `auto`, `split` or `same`. Applies to a ring or
+a line. Ignored when `MENTAT_CLAIM_SHAPE` is set. See "Claims".
 
 - `MENTAT_GPUS` (default: what `nvidia-smi` reports)
 

@@ -253,6 +253,7 @@ reserve the GPUs. Two groups may claim one node and compete for its devices.
 | `bundles` | A count of nodes at one GPU each, or a list of GPUs per node |
 | `link` | `rdma` or `ip`. An `rdma` set goes inside one fabric island (see "Placement") |
 | `layout?` | `mesh` (the default), `ring`, `line` or `star` |
+| `ports?` | For a ring or a line: `auto` (the default), `split` or `same`. Any other layout refuses a value other than `auto` |
 | `vendor` | Pins the set to one GPU vendor. Without it the daemon picks one |
 
 A `mesh` set is one island: every member links to every other. A `ring` set
@@ -271,6 +272,15 @@ node can be a hub. A daemon that does not know `star` refuses the claim with
 
 A daemon that predates `layout` drops the key and solves the set as a mesh.
 That placement is also a valid ring and line.
+
+`ports` says which ports a member reaches its two neighbours by. Two
+addresses of one node that reach the same far addresses count as one port.
+`split` needs different ports at every member that has two neighbours, and
+`same` needs one port. `auto` tries `split` and then takes the best link for
+each step. A ring or line search stops after 20,000 steps. A large cluster
+can then refuse a `split` or `same` set that has an answer, and `auto` then
+falls back. A daemon that predates `ports` drops the key and solves as
+`auto` without the split preference.
 
 ```json
 {"t": "claim_ok", "name": "myjob", "generation": 3, "head_node_id": "...",

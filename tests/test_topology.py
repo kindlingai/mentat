@@ -550,9 +550,10 @@ def wait_ring_free(daemons):
     )
 
 
-def claimed_ranks(daemon, claim, layout, n, keys):
+def claimed_ranks(daemon, claim, layout, n, keys, extra=None, refused=False):
     """Run a driver on `daemon` that places `n` one-GPU ranks under a claim
-    of `layout`, and return the `keys` of each rank's environment."""
+    of `layout`, and return the `keys` of each rank's environment. With
+    `refused`, the driver must fail, and this returns its output."""
     driver = f"""
 import json, os, sys
 sys.path[:0] = os.environ["PYTHONPATH"].split(os.pathsep)
@@ -574,9 +575,12 @@ print(json.dumps([{{k: e.get(k, "") for k in {list(keys)!r}}} for e in envs]), f
         [sys.executable, "-c", driver],
         env={**os.environ, "RAY_ADDRESS": daemon.address, "MENTAT_GROUP": "ring",
              "MENTAT_CLAIM": claim, "MENTAT_CLAIM_LAYOUT": layout,
-             "PYTHONPATH": os.pathsep.join([tl.PYTHON_PKG, HERE])},
+             "PYTHONPATH": os.pathsep.join([tl.PYTHON_PKG, HERE]), **(extra or {})},
         capture_output=True, text=True, timeout=180,
     )
+    if refused:
+        assert r.returncode != 0, r.stdout[-1500:]
+        return r.stdout + r.stderr
     assert r.returncode == 0, (r.stdout + r.stderr)[-1500:]
     return json.loads(r.stdout.strip().splitlines()[-1])
 
@@ -661,6 +665,22 @@ def t12b_a_star_claim_puts_its_hub_on_the_driver():
     assert {x["MENTAT_FABRIC_IP"] for x in ranks} == {""}, ranks
 
 
+def t12c_a_ring_claim_keeps_its_ports_rule():
+    """Each box's two cables go to two boxes, so every ring here splits its
+    neighbours across ports, and none keeps them on one."""
+    daemons = state["ring_daemons"]
+    keys = ("MENTAT_NODE_IP", "MENTAT_FABRIC_NEXT")
+    wait_ring_free(daemons)
+    ranks = claimed_ranks(daemons["r3"], "ring-split", "ring", 4, keys,
+                          extra={"MENTAT_CLAIM_PORTS": "split"})
+    assert [x["MENTAT_FABRIC_NEXT"] for x in ranks] == [
+        "10.110.3.2", "10.110.4.2", "10.110.1.2", "10.110.2.2"], ranks
+    wait_ring_free(daemons)
+    out = claimed_ranks(daemons["r3"], "ring-same", "ring", 4, keys,
+                        extra={"MENTAT_CLAIM_PORTS": "same"}, refused=True)
+    assert "one port" in out, out[-1500:]
+
+
 def main():
     tests = [
         t01_one_seed_reveals_the_whole_mesh,
@@ -678,6 +698,7 @@ def main():
         t11_the_router_forgets_a_dead_daemon,
         t12_a_ring_claim_places_in_cable_order,
         t12b_a_star_claim_puts_its_hub_on_the_driver,
+        t12c_a_ring_claim_keeps_its_ports_rule,
     ]
     try:
         for t in tests:

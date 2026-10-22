@@ -40,7 +40,7 @@ def _claim(gpu_bundles):
     one set covering these bundles over a fabric, which is what a
     tensor-parallel group wants and what placement did before claims existed.
     MENTAT_CLAIM_LAYOUT (`mesh`, `ring`, `line` or `star`) sets that set's
-    layout.
+    layout, and MENTAT_CLAIM_PORTS (`auto`, `split` or `same`) its ports.
 
     Returns "" when MENTAT_CLAIM is unset, which places exactly as before.
     """
@@ -58,6 +58,9 @@ def _claim(gpu_bundles):
         layout = os.environ.get("MENTAT_CLAIM_LAYOUT", "").strip()
         if layout:
             shape["sets"][0]["layout"] = layout
+        ports = os.environ.get("MENTAT_CLAIM_PORTS", "").strip()
+        if ports:
+            shape["sets"][0]["ports"] = ports
     _client.get_conn().request(
         {"t": "claim", "name": name, "shape": shape}, expect="claim_ok"
     )
