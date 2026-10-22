@@ -536,6 +536,20 @@ RING = [
 ]
 
 
+def ring_head(daemons):
+    hid = daemons["r1"].status_json()["head_node_id"]
+    return next(d for d in daemons.values() if d.status_json()["node_id"] == hid)
+
+
+def wait_ring_free(daemons):
+    """A claim solves against the GPUs free now, and the last driver's
+    actors hold theirs until the reap grace ends."""
+    wait_for(
+        lambda: ring_head(daemons).status_json("ring")["groups"]["ring"]["gpus_used"] == 0,
+        60, "the last driver's actors to free their GPUs",
+    )
+
+
 def claimed_ranks(daemon, claim, layout, n, keys):
     """Run a driver on `daemon` that places `n` one-GPU ranks under a claim
     of `layout`, and return the `keys` of each rank's environment."""
@@ -596,16 +610,12 @@ def t12_a_ring_claim_places_in_cable_order():
         daemons[name] = Daemon(lan, peers=peers, port=ports[name], env=env).wait_up()
     state["ring_daemons"] = daemons
 
-    def ring_head():
-        hid = daemons["r1"].status_json()["head_node_id"]
-        return next(d for d in daemons.values() if d.status_json()["node_id"] == hid)
-
-    wait_for(lambda: len(ring_head().status_json()["islands"]) == 4, 30,
+    wait_for(lambda: len(ring_head(daemons).status_json()["islands"]) == 4, 30,
              "the four cabled pairs as islands")
     for name, d in daemons.items():
         d.start_agent("ring", gpus=1, container=f"c{name}", env_extra={"MENTAT_NODE_IP": ""})
     wait_for(
-        lambda: ring_head().status_json("ring")["groups"].get("ring", {}).get("gpus_total") == 4,
+        lambda: ring_head(daemons).status_json("ring")["groups"].get("ring", {}).get("gpus_total") == 4,
         20, "four ring agents on the head",
     )
 
@@ -631,6 +641,7 @@ def t12b_a_star_claim_puts_its_hub_on_the_driver():
     three fits with any box as the hub. The driver's box gets it, and each
     leaf is told the hub's address on its own cable."""
     daemons = state["ring_daemons"]
+    wait_ring_free(daemons)
     ranks = claimed_ranks(daemons["r3"], "ring-star3", "star", 3, (
         "MENTAT_NODE_IP", "MENTAT_FABRIC_LAYOUT", "MENTAT_FABRIC_HUB",
         "MENTAT_FABRIC_LEAVES", "MENTAT_FABRIC_IP"))
