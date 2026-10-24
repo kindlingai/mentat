@@ -179,9 +179,11 @@ fn record_request(
 /// change. Storing what is already there changes nothing and is never
 /// refused, so a publisher may repeat itself on a timer.
 ///
-/// A record changes at most once per `interval`, the status push interval:
+/// A record is set at most once per `interval`, the status push interval:
 /// a peer sees only the value at each push, so a faster change would only
-/// add events.
+/// add events. A removal is always taken, so a publisher that stops can
+/// drop its record at once, and it starts the interval too, so set and
+/// remove in turn still make at most two events per interval.
 fn put_record(
     st: &mut State,
     name: &str,
@@ -197,7 +199,7 @@ fn put_record(
     }
     st.records_changed
         .retain(|_, t| now.saturating_duration_since(*t) < interval);
-    if st.records_changed.contains_key(name) {
+    if value.is_some() && st.records_changed.contains_key(name) {
         return Err((429, "a record changes at most once per status push\n"));
     }
     let mut next = st.records.clone();
@@ -239,7 +241,15 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String, HashMap<Strin
     let mut headers = HashMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            // A repeated field is one value with a comma between, as HTTP
+            // combines them, so two Content-Lengths do not parse.
+            headers
+                .entry(k.trim().to_ascii_lowercase())
+                .and_modify(|e: &mut String| {
+                    e.push_str(", ");
+                    e.push_str(v.trim());
+                })
+                .or_insert_with(|| v.trim().to_string());
         }
     }
     Some((method, path, headers))
@@ -608,6 +618,14 @@ mod tests {
         );
         // Another name has its own interval.
         assert_eq!(put_record(&mut st, "gr8", v("1"), at(10), IV), Ok(()));
+        // A removal is taken at once, and the next set waits out the interval.
+        assert_eq!(put_record(&mut st, "gr8", None, at(20), IV), Ok(()));
+        assert_eq!(
+            put_record(&mut st, "gr8", v("1"), at(30), IV)
+                .unwrap_err()
+                .0,
+            429
+        );
         assert_eq!(
             put_record(&mut st, "model-loader", v("2"), t0 + IV, IV),
             Ok(())

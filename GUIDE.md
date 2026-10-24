@@ -912,9 +912,9 @@ top-level `records` of `/status`. It sends them to every peer with each
 status push, and every peer shows them as `records` on this box's row,
 within one `MENTAT_PEER_STATUS_INTERVAL_MS`. Only a process on this box may
 write, as the port has no authentication. All of a box's records together
-are at most 16 KiB of JSON (`413`), a fixed protocol limit. Each record
-changes at most once per `MENTAT_PEER_STATUS_INTERVAL_MS` (`429`), as a peer
-sees only the value at each push.
+are at most 16 KiB of JSON (`413`), a fixed protocol limit. Each record is
+set at most once per `MENTAT_PEER_STATUS_INTERVAL_MS` (`429`), as a peer
+sees only the value at each push. A delete is always taken.
 The mesh carries a summary. Bulk data goes over the publisher's own port.
 
 Records are soft state. A restarted daemon holds none, and a stopped

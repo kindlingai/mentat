@@ -787,7 +787,10 @@ are at most 16384 bytes as JSON text, else `413`. The limit is part of the
 protocol, the same on every daemon, so a publisher can size its record
 against it, and changing it is a version change. A record changes at most
 once per `MENTAT_PEER_STATUS_INTERVAL_MS`, else `429`, since a peer sees only
-the value at each push. Storing the value already held is never refused and
+the value at each push. A `DELETE` is always taken, so a publisher that stops
+can drop its record at once, and starts the interval too. A repeated header
+counts as one value with a comma between, so two `Content-Length`s are
+`400`. Storing the value already held is never refused and
 emits nothing. Records are soft state: a restarted daemon holds none.
 
 | Metric | Labels | Meaning |

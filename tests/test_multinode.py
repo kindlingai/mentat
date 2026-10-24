@@ -163,6 +163,11 @@ def t02c_a_record_put_on_one_node_reads_on_the_others():
     assert put_record(d1, "model-loader", rec) == 204
     assert put_record(d1, "model-loader", {"port": 1}) == 429
     assert put_record(d1, "Model-Loader", rec) == 400
+    # A delete is taken at once, and a set right after it waits.
+    assert put_record(d1, "gone") == 204
+    assert put_record(d1, "scratch", 1) == 204
+    assert put_record(d1, "scratch") == 204
+    assert put_record(d1, "scratch", 2) == 429
     assert put_record(d1, "big", "x" * 20000) == 413
     assert d1.status_json()["records"] == {"model-loader": rec}
     for d in (d2, d3):
@@ -175,6 +180,8 @@ def t02c_a_record_put_on_one_node_reads_on_the_others():
         b"PUT /records/short HTTP/1.1\r\nContent-Length: 100\r\n\r\n12",
         b"PUT /records/chunked HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n12\r\n0\r\n\r\n",
         b"PUT /records/nolength HTTP/1.1\r\n\r\n12",
+        b"PUT /records/dup HTTP/1.1\r\nContent-Length: 100\r\nContent-Length: 2\r\n\r\n12",
+        b"PUT /records/dup HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 100\r\n\r\n12",
     ):
         with socket.create_connection(("127.0.0.1", d1.http_port), timeout=15) as c:
             c.sendall(raw)
