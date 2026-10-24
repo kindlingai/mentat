@@ -15,6 +15,7 @@ itself the test that those knobs work.
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -167,7 +168,35 @@ def t02c_a_record_put_on_one_node_reads_on_the_others():
     for d in (d2, d3):
         wait_for(lambda: d.status_json()["peers"][d1_id]["records"]
                  == {"model-loader": rec}, 10, "the record to reach a peer")
+
+    # A body is taken only at its exact Content-Length: a short one or a
+    # chunked one is refused, not stored as whatever arrived.
+    for raw in (
+        b"PUT /records/short HTTP/1.1\r\nContent-Length: 100\r\n\r\n12",
+        b"PUT /records/chunked HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n12\r\n0\r\n\r\n",
+        b"PUT /records/nolength HTTP/1.1\r\n\r\n12",
+    ):
+        with socket.create_connection(("127.0.0.1", d1.http_port), timeout=15) as c:
+            c.sendall(raw)
+            c.shutdown(socket.SHUT_WR)
+            assert c.recv(64).startswith(b"HTTP/1.1 400"), raw
+    assert d1.status_json()["records"] == {"model-loader": rec}
+
+    # Each daemon derives peer_records from the pushes it gets and tells its
+    # own subscribers only. Replicated, every peer's copy would reach every
+    # other peer.
+    d2_id, d3_id = (d.status_json()["node_id"] for d in (d2, d3))
+    stream = tl.EventStream(d3.http_port)
+    stream.frame(5)  # the snapshot
     assert put_record(d1, "model-loader") == 204
+    seen = set()
+    for evt in stream.events(time.time() + 3):
+        if evt["type"] in ("record_changed", "peer_records"):
+            seen.add((evt["type"], evt["node"]))
+    stream.close()
+    assert ("record_changed", d1_id) in seen, seen
+    assert ("peer_records", d3_id) in seen, seen
+    assert ("peer_records", d2_id) not in seen, seen
     wait_for(lambda: d2.status_json()["peers"][d1_id]["records"] == {},
              10, "the removal to reach a peer")
 

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -119,37 +119,54 @@ fn record_request(
             b"records are written from this box only\n",
         );
     }
-    let now = crate::state::now_ms_u64();
-    let interval = crate::config::cfg().peer_status_interval_ms;
+    // The push interval, as status_pusher bounds it.
+    let interval = Duration::from_millis(crate::config::cfg().peer_status_interval_ms.max(50));
     let result = match method {
         "PUT" => {
-            let len: usize = headers
-                .get("content-length")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
+            // A chunked body would be read as headers' end and garbage, and
+            // a short one as a different value, so only an exact length is
+            // taken.
+            let len = match headers.get("content-length").map(|v| v.parse::<usize>()) {
+                Some(Ok(len)) if !headers.contains_key("transfer-encoding") => len,
+                _ => {
+                    return respond(
+                        stream,
+                        400,
+                        "text/plain",
+                        b"PUT takes a Content-Length body\n",
+                    )
+                }
+            };
             if len > MAX_RECORDS_BYTES {
                 return respond(stream, 413, "text/plain", b"record over the node's limit\n");
             }
-            let mut body = Vec::new();
-            if (&mut *stream)
-                .take(len as u64)
-                .read_to_end(&mut body)
-                .is_err()
-            {
-                return;
+            let mut body = vec![0u8; len];
+            if stream.read_exact(&mut body).is_err() {
+                return respond(
+                    stream,
+                    400,
+                    "text/plain",
+                    b"body shorter than Content-Length\n",
+                );
             }
             match serde_json::from_slice(&body) {
                 Ok(value) => put_record(
                     &mut shared.st.lock().unwrap(),
                     name,
                     Some(value),
-                    now,
+                    Instant::now(),
                     interval,
                 ),
                 Err(_) => Err((400, "the body is not JSON\n")),
             }
         }
-        "DELETE" => put_record(&mut shared.st.lock().unwrap(), name, None, now, interval),
+        "DELETE" => put_record(
+            &mut shared.st.lock().unwrap(),
+            name,
+            None,
+            Instant::now(),
+            interval,
+        ),
         _ => Err((405, "PUT or DELETE\n")),
     };
     match result {
@@ -169,8 +186,8 @@ fn put_record(
     st: &mut State,
     name: &str,
     value: Option<serde_json::Value>,
-    now: u64,
-    interval: u64,
+    now: Instant,
+    interval: Duration,
 ) -> Result<(), (u16, &'static str)> {
     if !crate::meta::valid_key(name) {
         return Err((400, "a name is up to 64 of a-z, 0-9, '.', '_' and '-'\n"));
@@ -178,9 +195,9 @@ fn put_record(
     if st.records.get(name) == value.as_ref() {
         return Ok(());
     }
-    st.records_changed_ms
-        .retain(|_, t| now.saturating_sub(*t) < interval);
-    if st.records_changed_ms.contains_key(name) {
+    st.records_changed
+        .retain(|_, t| now.saturating_duration_since(*t) < interval);
+    if st.records_changed.contains_key(name) {
         return Err((429, "a record changes at most once per status push\n"));
     }
     let mut next = st.records.clone();
@@ -192,7 +209,7 @@ fn put_record(
         return Err((413, "record over the node's limit\n"));
     }
     st.records = next;
-    st.records_changed_ms.insert(name.to_string(), now);
+    st.records_changed.insert(name.to_string(), now);
     let patch = match value {
         Some(v) => crate::state::Patch::set(&["records", name], v),
         None => crate::state::Patch::remove(&["records", name]),
@@ -567,31 +584,45 @@ mod tests {
     fn records_are_bounded_in_name_size_and_rate() {
         let mut st = State::new("127.0.0.1".into(), "h".into(), "127.0.0.1:6379".into());
         let v = |s: &str| Some(json!({ "port": s }));
-        const IV: u64 = 2_000;
+        const IV: Duration = Duration::from_millis(2_000);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
         assert_eq!(
-            put_record(&mut st, "Bad Name", v("1"), 0, IV),
+            put_record(&mut st, "Bad Name", v("1"), at(0), IV),
             Err((400, "a name is up to 64 of a-z, 0-9, '.', '_' and '-'\n"))
         );
-        assert_eq!(put_record(&mut st, "model-loader", v("1"), 0, IV), Ok(()));
-        // The same value again is free; a new one inside the interval is not.
-        assert_eq!(put_record(&mut st, "model-loader", v("1"), 10, IV), Ok(()));
         assert_eq!(
-            put_record(&mut st, "model-loader", v("2"), 10, IV)
+            put_record(&mut st, "model-loader", v("1"), at(0), IV),
+            Ok(())
+        );
+        // The same value again is free; a new one inside the interval is not.
+        assert_eq!(
+            put_record(&mut st, "model-loader", v("1"), at(10), IV),
+            Ok(())
+        );
+        assert_eq!(
+            put_record(&mut st, "model-loader", v("2"), at(10), IV)
                 .unwrap_err()
                 .0,
             429
         );
         // Another name has its own interval.
-        assert_eq!(put_record(&mut st, "gr8", v("1"), 10, IV), Ok(()));
-        assert_eq!(put_record(&mut st, "model-loader", v("2"), IV, IV), Ok(()));
+        assert_eq!(put_record(&mut st, "gr8", v("1"), at(10), IV), Ok(()));
+        assert_eq!(
+            put_record(&mut st, "model-loader", v("2"), t0 + IV, IV),
+            Ok(())
+        );
         let big = Some(json!("x".repeat(MAX_RECORDS_BYTES)));
-        assert_eq!(put_record(&mut st, "big", big, 0, IV).unwrap_err().0, 413);
-        assert_eq!(put_record(&mut st, "gr8", None, 5_000, IV), Ok(()));
+        assert_eq!(
+            put_record(&mut st, "big", big, at(0), IV).unwrap_err().0,
+            413
+        );
+        assert_eq!(put_record(&mut st, "gr8", None, at(5_000), IV), Ok(()));
         assert_eq!(
             serde_json::to_value(&st.records).unwrap(),
             json!({"model-loader": {"port": "2"}})
         );
         // Removing what is not there changes nothing.
-        assert_eq!(put_record(&mut st, "gr8", None, 5_001, IV), Ok(()));
+        assert_eq!(put_record(&mut st, "gr8", None, at(5_001), IV), Ok(()));
     }
 }

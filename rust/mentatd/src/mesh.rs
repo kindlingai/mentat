@@ -630,7 +630,7 @@ fn peer_loop(
                 if records_changed {
                     let row = st.peers.get(&peer_id).map(crate::status::peer_row);
                     if let Some(row) = row {
-                        st.emit_patch(
+                        st.emit_patch_local(
                             "peer_records",
                             vec![crate::state::Patch::set(&["peers", &peer_id], row)],
                             "",

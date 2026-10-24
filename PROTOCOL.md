@@ -759,6 +759,8 @@ events from an older `boot_id` starts again from the new snapshot.
 
 Each daemon replicates its own events to every live peer in `peer_event`.
 It delivers a peer's event to its own subscribers without re-forwarding it.
+`peer_records` is not replicated: each daemon derives it from the pushes it
+receives, so every peer would otherwise forward its copy to every other.
 A replicated event describes the originating node's snapshot. A receiving
 daemon's snapshot summarises its peers and does not hold their rows. A
 consumer therefore applies only events whose `node` is the daemon it is
@@ -778,7 +780,8 @@ Daemon, port 6380:
 | `DELETE /records/<name>` | `204`. Drops the record |
 
 Every other method is `405`. Only a loopback client may write a record, and
-any other gets `403`. A name is 1 to 64 of `a-z`, `0-9`, `.`, `_` and `-`,
+any other gets `403`. A `PUT` body is exactly `Content-Length` bytes. One
+without the header, with `Transfer-Encoding`, or cut short is `400`. A name is 1 to 64 of `a-z`, `0-9`, `.`, `_` and `-`,
 else `400`, as is a body that is not JSON. All of a node's records together
 are at most 16384 bytes as JSON text, else `413`. The limit is part of the
 protocol, the same on every daemon, so a publisher can size its record
