@@ -393,6 +393,11 @@ pub struct State {
     pub boot_id: String,
     /// Live WebSocket subscribers get every new event pushed.
     pub event_subs: Vec<std::sync::mpsc::Sender<String>>,
+    /// What local processes publish about this node through
+    /// `PUT /records/<name>`. The snapshot carries it to every peer.
+    pub records: std::collections::BTreeMap<String, Value>,
+    /// When each record name last changed, for the rate limit in http.rs.
+    pub records_changed_ms: HashMap<String, u64>,
 }
 
 pub struct Shared {
@@ -440,6 +445,8 @@ impl State {
             next_event_seq: 1,
             boot_id: mentat_common::secret::boot_id(),
             event_subs: Vec::new(),
+            records: std::collections::BTreeMap::new(),
+            records_changed_ms: HashMap::new(),
         }
     }
 

@@ -587,7 +587,10 @@ fn peer_loop(
         match frame.msg {
             Msg::PeerStatus { snapshot: data } => {
                 let mut st = shared.st.lock().unwrap();
+                let mut records_changed = false;
                 if let Some(p) = st.peers.get_mut(&peer_id) {
+                    records_changed = crate::status::records_of(&data)
+                        != crate::status::records_of(&p.last_status);
                     // The push holds the peer's current addresses. The
                     // hello held the ones it had when the link came up.
                     let addrs = str_list(&data["addrs"]);
@@ -622,6 +625,16 @@ fn peer_loop(
                     if p.stale {
                         p.stale = false;
                         log("peer_recovered", &[("peer", peer_id.clone())]);
+                    }
+                }
+                if records_changed {
+                    let row = st.peers.get(&peer_id).map(crate::status::peer_row);
+                    if let Some(row) = row {
+                        st.emit_patch(
+                            "peer_records",
+                            vec![crate::state::Patch::set(&["peers", &peer_id], row)],
+                            "",
+                        );
                     }
                 }
             }
@@ -888,7 +901,7 @@ fn status_pusher(shared: SharedRef) {
     let interval = Duration::from_millis(cfg().peer_status_interval_ms.max(50));
     loop {
         std::thread::sleep(interval);
-        let (snap, writers): (serde_json::Value, Vec<FrameWriter>) = {
+        let (mut snap, writers): (serde_json::Value, Vec<FrameWriter>) = {
             let st = shared.st.lock().unwrap();
             (
                 crate::status::snapshot(&st, None),
@@ -899,6 +912,18 @@ fn status_pusher(shared: SharedRef) {
                     .collect(),
             )
         };
+        // A peer reads each node's records from that node's own push, so
+        // the copies in the peer rows stay home and the push grows with
+        // the mesh, not with its square.
+        for row in snap["peers"]
+            .as_object_mut()
+            .into_iter()
+            .flat_map(|m| m.values_mut())
+        {
+            if let Some(row) = row.as_object_mut() {
+                row.remove("records");
+            }
+        }
         for w in writers {
             let _ = w.send(
                 Msg::PeerStatus {

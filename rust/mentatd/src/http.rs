@@ -1,7 +1,8 @@
 //! Tiny dependency-free HTTP side-port: /metrics (Prometheus text), /status
-//! (JSON), /healthz, and /events (WebSocket event stream with a snapshot on
-//! connect). The daemon's message rate makes a real HTTP stack pointless;
-//! hand-rolling keeps the binary free of an async runtime.
+//! (JSON), /healthz, /events (WebSocket event stream with a snapshot on
+//! connect), and PUT/DELETE /records/<name> for local processes to publish
+//! about this node. The daemon's message rate makes a real HTTP stack
+//! pointless; hand-rolling keeps the binary free of an async runtime.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -11,8 +12,15 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::state::{ActorState, SharedRef};
+use crate::state::{ActorState, SharedRef, State};
 use mentat_common::logfmt::log;
+
+/// The most all of a node's records may take as JSON text. Every peer
+/// receives them on each status push, so this bounds what they add to it.
+pub const MAX_RECORDS_BYTES: usize = 16 * 1024;
+/// How often one record may change. A peer sees a change at the next push
+/// anyway, so a faster publisher would only add events.
+pub const RECORD_MIN_INTERVAL_MS: u64 = 1_000;
 
 pub fn serve(shared: SharedRef, port: u16) {
     std::thread::spawn(move || {
@@ -36,12 +44,18 @@ pub fn serve(shared: SharedRef, port: u16) {
 
 fn handle(shared: SharedRef, mut stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let Some((path, headers)) = read_request(&mut stream) else {
+    let Some((method, path, headers)) = read_request(&mut stream) else {
         return;
     };
     let path_only = path.split('?').next().unwrap_or("");
     let query = path.split('?').nth(1).unwrap_or("");
 
+    if let Some(name) = path_only.strip_prefix("/records/") {
+        return record_request(&shared, &mut stream, &method, name, &headers);
+    }
+    if method != "GET" {
+        return respond(&mut stream, 405, "text/plain", b"GET only\n");
+    }
     match path_only {
         "/healthz" => respond(&mut stream, 200, "text/plain", b"ok\n"),
         "/metrics" => {
@@ -88,7 +102,95 @@ fn handle(shared: SharedRef, mut stream: TcpStream) {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<(String, HashMap<String, String>)> {
+/// `PUT /records/<name>` stores the JSON body as this node's record
+/// `name`, and `DELETE` drops it. Only a process on this box may, since the
+/// port has no other authentication.
+fn record_request(
+    shared: &SharedRef,
+    stream: &mut TcpStream,
+    method: &str,
+    name: &str,
+    headers: &HashMap<String, String>,
+) {
+    if !stream.peer_addr().is_ok_and(|a| a.ip().is_loopback()) {
+        return respond(
+            stream,
+            403,
+            "text/plain",
+            b"records are written from this box only\n",
+        );
+    }
+    let now = crate::state::now_ms_u64();
+    let result = match method {
+        "PUT" => {
+            let len: usize = headers
+                .get("content-length")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if len > MAX_RECORDS_BYTES {
+                return respond(stream, 413, "text/plain", b"record over the node's limit\n");
+            }
+            let mut body = Vec::new();
+            if (&mut *stream)
+                .take(len as u64)
+                .read_to_end(&mut body)
+                .is_err()
+            {
+                return;
+            }
+            match serde_json::from_slice(&body) {
+                Ok(value) => put_record(&mut shared.st.lock().unwrap(), name, Some(value), now),
+                Err(_) => Err((400, "the body is not JSON\n")),
+            }
+        }
+        "DELETE" => put_record(&mut shared.st.lock().unwrap(), name, None, now),
+        _ => Err((405, "PUT or DELETE\n")),
+    };
+    match result {
+        Ok(()) => respond(stream, 204, "text/plain", b""),
+        Err((code, why)) => respond(stream, code, "text/plain", why.as_bytes()),
+    }
+}
+
+/// Sets record `name` to `value`, or removes it for None, and emits the
+/// change. Storing what is already there changes nothing and is never
+/// refused, so a publisher may repeat itself on a timer.
+fn put_record(
+    st: &mut State,
+    name: &str,
+    value: Option<serde_json::Value>,
+    now: u64,
+) -> Result<(), (u16, &'static str)> {
+    if !crate::meta::valid_key(name) {
+        return Err((400, "a name is up to 64 of a-z, 0-9, '.', '_' and '-'\n"));
+    }
+    if st.records.get(name) == value.as_ref() {
+        return Ok(());
+    }
+    st.records_changed_ms
+        .retain(|_, t| now.saturating_sub(*t) < RECORD_MIN_INTERVAL_MS);
+    if st.records_changed_ms.contains_key(name) {
+        return Err((429, "a record changes at most once a second\n"));
+    }
+    let mut next = st.records.clone();
+    match &value {
+        Some(v) => next.insert(name.to_string(), v.clone()),
+        None => next.remove(name),
+    };
+    if serde_json::to_string(&next).map_or(0, |t| t.len()) > MAX_RECORDS_BYTES {
+        return Err((413, "record over the node's limit\n"));
+    }
+    st.records = next;
+    st.records_changed_ms.insert(name.to_string(), now);
+    let patch = match value {
+        Some(v) => crate::state::Patch::set(&["records", name], v),
+        None => crate::state::Patch::remove(&["records", name]),
+    };
+    st.emit_patch("record_changed", vec![patch], "");
+    Ok(())
+}
+
+fn read_request(stream: &mut TcpStream) -> Option<(String, String, HashMap<String, String>)> {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     while !buf.ends_with(b"\r\n\r\n") {
@@ -104,10 +206,7 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, HashMap<String, Strin
     let mut lines = text.lines();
     let request_line = lines.next()?;
     let mut parts = request_line.split_whitespace();
-    let method = parts.next()?;
-    if method != "GET" {
-        return None;
-    }
+    let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
     let mut headers = HashMap::new();
     for line in lines {
@@ -115,13 +214,18 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, HashMap<String, Strin
             headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
     }
-    Some((path, headers))
+    Some((method, path, headers))
 }
 
 fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) {
     let reason = match code {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
+        403 => "Forbidden",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        429 => "Too Many Requests",
         _ => "Not Found",
     };
     let head = format!(
@@ -446,5 +550,39 @@ mod tests {
             b"dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11",
         ));
         assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    #[test]
+    fn records_are_bounded_in_name_size_and_rate() {
+        let mut st = State::new("127.0.0.1".into(), "h".into(), "127.0.0.1:6379".into());
+        let v = |s: &str| Some(json!({ "port": s }));
+        assert_eq!(
+            put_record(&mut st, "Bad Name", v("1"), 0),
+            Err((400, "a name is up to 64 of a-z, 0-9, '.', '_' and '-'\n"))
+        );
+        assert_eq!(put_record(&mut st, "model-loader", v("1"), 0), Ok(()));
+        // The same value again is free; a new one inside the interval is not.
+        assert_eq!(put_record(&mut st, "model-loader", v("1"), 10), Ok(()));
+        assert_eq!(
+            put_record(&mut st, "model-loader", v("2"), 10)
+                .unwrap_err()
+                .0,
+            429
+        );
+        // Another name has its own interval.
+        assert_eq!(put_record(&mut st, "gr8", v("1"), 10), Ok(()));
+        assert_eq!(
+            put_record(&mut st, "model-loader", v("2"), RECORD_MIN_INTERVAL_MS),
+            Ok(())
+        );
+        let big = Some(json!("x".repeat(MAX_RECORDS_BYTES)));
+        assert_eq!(put_record(&mut st, "big", big, 0).unwrap_err().0, 413);
+        assert_eq!(put_record(&mut st, "gr8", None, 5_000), Ok(()));
+        assert_eq!(
+            serde_json::to_value(&st.records).unwrap(),
+            json!({"model-loader": {"port": "2"}})
+        );
+        // Removing what is not there changes nothing.
+        assert_eq!(put_record(&mut st, "gr8", None, 5_001), Ok(()));
     }
 }

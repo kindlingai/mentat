@@ -42,7 +42,7 @@ pub fn collect() -> Meta {
 }
 
 /// A key is lowercase ASCII letters, digits, `.`, `_` and `-`.
-fn valid_key(k: &str) -> bool {
+pub fn valid_key(k: &str) -> bool {
     !k.is_empty()
         && k.len() <= MAX_KEY_LEN
         && k.bytes()

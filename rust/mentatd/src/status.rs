@@ -128,7 +128,14 @@ pub fn peer_row(p: &PeerInfo) -> Value {
         "last_seen_ms": p.last_seen_ms,
         "dead_since_ms": p.dead_since_ms,
         "groups": peer_groups(p),
+        "records": records_of(&p.last_status),
     })
+}
+
+/// The `records` a snapshot holds, `{}` when it holds none, as from a build
+/// that predates them.
+pub fn records_of(snapshot: &Value) -> Value {
+    Value::Object(snapshot["records"].as_object().cloned().unwrap_or_default())
 }
 
 /// A peer's groups as its own snapshot last reported them, reduced to the
@@ -272,6 +279,7 @@ pub fn snapshot(st: &State, scope: Option<&str>) -> Value {
             "addrs": i.addr,
         })).collect::<Vec<_>>(),
         "peers": peers,
+        "records": st.records,
         "clients": clients,
         "groups": out_groups,
         "counters": {
