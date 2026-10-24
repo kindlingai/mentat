@@ -788,7 +788,8 @@ protocol, the same on every daemon, so a publisher can size its record
 against it, and changing it is a version change. A record changes at most
 once per `MENTAT_PEER_STATUS_INTERVAL_MS`, else `429`, since a peer sees only
 the value at each push. A `DELETE` is always taken, so a publisher that stops
-can drop its record at once, and starts the interval too. A repeated header
+can drop its record at once. Removing a record starts the interval too, and
+deleting one that is not there changes nothing. A repeated header
 counts as one value with a comma between, so two `Content-Length`s are
 `400`. Storing the value already held is never refused and
 emits nothing. Records are soft state: a restarted daemon holds none.

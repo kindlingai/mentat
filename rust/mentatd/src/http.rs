@@ -182,7 +182,7 @@ fn record_request(
 /// A record is set at most once per `interval`, the status push interval:
 /// a peer sees only the value at each push, so a faster change would only
 /// add events. A removal is always taken, so a publisher that stops can
-/// drop its record at once, and it starts the interval too, so set and
+/// drop its record at once, and a removal starts the interval too, so set and
 /// remove in turn still make at most two events per interval.
 fn put_record(
     st: &mut State,
@@ -412,7 +412,12 @@ fn metrics(shared: &SharedRef) -> String {
 // ---------------------------------------------------------------------------
 
 fn websocket_events(shared: SharedRef, mut stream: TcpStream, headers: &HashMap<String, String>) {
-    let Some(key) = headers.get("sec-websocket-key") else {
+    // A repeated key reads as two joined by a comma, which no base64 key
+    // holds, and would hash to an accept value for neither.
+    let Some(key) = headers
+        .get("sec-websocket-key")
+        .filter(|k| !k.contains(','))
+    else {
         return;
     };
     let accept = base64(&sha1(
