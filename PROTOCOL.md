@@ -780,8 +780,11 @@ Daemon, port 6380:
 Every other method is `405`. Only a loopback client may write a record, and
 any other gets `403`. A name is 1 to 64 of `a-z`, `0-9`, `.`, `_` and `-`,
 else `400`, as is a body that is not JSON. All of a node's records together
-are at most 16 KiB as JSON text, else `413`. A record changes at most once a
-second, else `429`. Storing the value already held is never refused and
+are at most 16384 bytes as JSON text, else `413`. The limit is part of the
+protocol, the same on every daemon, so a publisher can size its record
+against it, and changing it is a version change. A record changes at most
+once per `MENTAT_PEER_STATUS_INTERVAL_MS`, else `429`, since a peer sees only
+the value at each push. Storing the value already held is never refused and
 emits nothing. Records are soft state: a restarted daemon holds none.
 
 | Metric | Labels | Meaning |

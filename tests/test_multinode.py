@@ -157,16 +157,16 @@ def t02c_a_record_put_on_one_node_reads_on_the_others():
     d1_id = state["d1_id"]
     rec = {"port": 7762, "holdings": ["org/model@abc123"]}
     assert put_record(d1, "model-loader", rec) == 204
-    assert d1.status_json()["records"] == {"model-loader": rec}
-    for d in (d2, d3):
-        wait_for(lambda: d.status_json()["peers"][d1_id]["records"]
-                 == {"model-loader": rec}, 10, "the record to reach a peer")
-    # Repeating the record is free; changing it again at once is refused.
+    # Repeating the record is free. Changing it again within one status
+    # push interval is refused.
     assert put_record(d1, "model-loader", rec) == 204
     assert put_record(d1, "model-loader", {"port": 1}) == 429
     assert put_record(d1, "Model-Loader", rec) == 400
     assert put_record(d1, "big", "x" * 20000) == 413
-    time.sleep(1.1)
+    assert d1.status_json()["records"] == {"model-loader": rec}
+    for d in (d2, d3):
+        wait_for(lambda: d.status_json()["peers"][d1_id]["records"]
+                 == {"model-loader": rec}, 10, "the record to reach a peer")
     assert put_record(d1, "model-loader") == 204
     wait_for(lambda: d2.status_json()["peers"][d1_id]["records"] == {},
              10, "the removal to reach a peer")

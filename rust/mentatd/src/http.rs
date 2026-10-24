@@ -17,10 +17,9 @@ use mentat_common::logfmt::log;
 
 /// The most all of a node's records may take as JSON text. Every peer
 /// receives them on each status push, so this bounds what they add to it.
+/// A publisher sizes its record against this, so it is part of the
+/// protocol, the same on every daemon, and not a setting.
 pub const MAX_RECORDS_BYTES: usize = 16 * 1024;
-/// How often one record may change. A peer sees a change at the next push
-/// anyway, so a faster publisher would only add events.
-pub const RECORD_MIN_INTERVAL_MS: u64 = 1_000;
 
 pub fn serve(shared: SharedRef, port: u16) {
     std::thread::spawn(move || {
@@ -121,6 +120,7 @@ fn record_request(
         );
     }
     let now = crate::state::now_ms_u64();
+    let interval = crate::config::cfg().peer_status_interval_ms;
     let result = match method {
         "PUT" => {
             let len: usize = headers
@@ -139,11 +139,17 @@ fn record_request(
                 return;
             }
             match serde_json::from_slice(&body) {
-                Ok(value) => put_record(&mut shared.st.lock().unwrap(), name, Some(value), now),
+                Ok(value) => put_record(
+                    &mut shared.st.lock().unwrap(),
+                    name,
+                    Some(value),
+                    now,
+                    interval,
+                ),
                 Err(_) => Err((400, "the body is not JSON\n")),
             }
         }
-        "DELETE" => put_record(&mut shared.st.lock().unwrap(), name, None, now),
+        "DELETE" => put_record(&mut shared.st.lock().unwrap(), name, None, now, interval),
         _ => Err((405, "PUT or DELETE\n")),
     };
     match result {
@@ -155,11 +161,16 @@ fn record_request(
 /// Sets record `name` to `value`, or removes it for None, and emits the
 /// change. Storing what is already there changes nothing and is never
 /// refused, so a publisher may repeat itself on a timer.
+///
+/// A record changes at most once per `interval`, the status push interval:
+/// a peer sees only the value at each push, so a faster change would only
+/// add events.
 fn put_record(
     st: &mut State,
     name: &str,
     value: Option<serde_json::Value>,
     now: u64,
+    interval: u64,
 ) -> Result<(), (u16, &'static str)> {
     if !crate::meta::valid_key(name) {
         return Err((400, "a name is up to 64 of a-z, 0-9, '.', '_' and '-'\n"));
@@ -168,9 +179,9 @@ fn put_record(
         return Ok(());
     }
     st.records_changed_ms
-        .retain(|_, t| now.saturating_sub(*t) < RECORD_MIN_INTERVAL_MS);
+        .retain(|_, t| now.saturating_sub(*t) < interval);
     if st.records_changed_ms.contains_key(name) {
-        return Err((429, "a record changes at most once a second\n"));
+        return Err((429, "a record changes at most once per status push\n"));
     }
     let mut next = st.records.clone();
     match &value {
@@ -556,33 +567,31 @@ mod tests {
     fn records_are_bounded_in_name_size_and_rate() {
         let mut st = State::new("127.0.0.1".into(), "h".into(), "127.0.0.1:6379".into());
         let v = |s: &str| Some(json!({ "port": s }));
+        const IV: u64 = 2_000;
         assert_eq!(
-            put_record(&mut st, "Bad Name", v("1"), 0),
+            put_record(&mut st, "Bad Name", v("1"), 0, IV),
             Err((400, "a name is up to 64 of a-z, 0-9, '.', '_' and '-'\n"))
         );
-        assert_eq!(put_record(&mut st, "model-loader", v("1"), 0), Ok(()));
+        assert_eq!(put_record(&mut st, "model-loader", v("1"), 0, IV), Ok(()));
         // The same value again is free; a new one inside the interval is not.
-        assert_eq!(put_record(&mut st, "model-loader", v("1"), 10), Ok(()));
+        assert_eq!(put_record(&mut st, "model-loader", v("1"), 10, IV), Ok(()));
         assert_eq!(
-            put_record(&mut st, "model-loader", v("2"), 10)
+            put_record(&mut st, "model-loader", v("2"), 10, IV)
                 .unwrap_err()
                 .0,
             429
         );
         // Another name has its own interval.
-        assert_eq!(put_record(&mut st, "gr8", v("1"), 10), Ok(()));
-        assert_eq!(
-            put_record(&mut st, "model-loader", v("2"), RECORD_MIN_INTERVAL_MS),
-            Ok(())
-        );
+        assert_eq!(put_record(&mut st, "gr8", v("1"), 10, IV), Ok(()));
+        assert_eq!(put_record(&mut st, "model-loader", v("2"), IV, IV), Ok(()));
         let big = Some(json!("x".repeat(MAX_RECORDS_BYTES)));
-        assert_eq!(put_record(&mut st, "big", big, 0).unwrap_err().0, 413);
-        assert_eq!(put_record(&mut st, "gr8", None, 5_000), Ok(()));
+        assert_eq!(put_record(&mut st, "big", big, 0, IV).unwrap_err().0, 413);
+        assert_eq!(put_record(&mut st, "gr8", None, 5_000, IV), Ok(()));
         assert_eq!(
             serde_json::to_value(&st.records).unwrap(),
             json!({"model-loader": {"port": "2"}})
         );
         // Removing what is not there changes nothing.
-        assert_eq!(put_record(&mut st, "gr8", None, 5_001), Ok(()));
+        assert_eq!(put_record(&mut st, "gr8", None, 5_001, IV), Ok(()));
     }
 }
