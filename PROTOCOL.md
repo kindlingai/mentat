@@ -433,6 +433,11 @@ as protocol input:
 | `peers/<node_id>/addrs`, `addr_tags` | Island membership, which decides where an `rdma` claim fits |
 | `peers/<node_id>/probes/<local>/<remote>/ok`, `rtt_ms` | The link topology a claim is solved against, and island membership |
 | `groups/<group>/gpus_total`, `gpus_used` | The per-group summary in a peer row |
+| `records` | The sending peer's `records` in its row |
+
+The push leaves `records` out of each row under `peers`. A receiver reads a
+node's records from that node's own push, so a push carries one node's
+records, not the whole mesh's.
 
 Every other key is output for the HTTP readers. A change to the shape of a
 key in the table is a mesh change and a major bump, whatever it does to
@@ -641,7 +646,9 @@ the same object. `?group=` on `/status` and `group` on `status` scope it.
                                        "last_ok_ms": null, "error": "",
                                        "neighbour_mac": "aa:bb:cc:dd:ee:02",
                                        "direct": true}}},
-   "groups": {"<group>": {"gpus_total": 2, "gpus_used": 1}}}},
+   "groups": {"<group>": {"gpus_total": 2, "gpus_used": 1}},
+   "records": {"model-loader": {"port": 7762}}}},
+ "records": {"model-loader": {"port": 7762}},
  "clients": {"<client_id>": {"group": "glm", "kind": "driver",
                              "node_id": "...", "session": true}},
  "groups": {"<group>": {
@@ -675,6 +682,7 @@ one row by path.
 | `clients` | The connections this daemon serves. `session` marks the one whose EOF reaps the group |
 | `claims` | Filled on the head only. Empty elsewhere |
 | `sets` | Each set's node count |
+| `records` | What local processes published about the node, by name. Each value is the JSON body of its `PUT /records/<name>`. A peer's row holds its records as of its last push, and a dead peer's row keeps them |
 
 The addresses and interfaces behind `sets` are in the view `claim` returns.
 That view is too large to push on an interval.
@@ -709,7 +717,8 @@ The paths below are written with `/`. Each is the array of its keys.
 
 | Event | Path |
 | --- | --- |
-| `node_join`, `node_leave`, `peer_forgotten` | `peers/<node_id>` |
+| `node_join`, `node_leave`, `peer_forgotten`, `peer_records` | `peers/<node_id>` |
+| `record_changed` | `records/<name>` |
 | `head_change` | `head_node_id` and `head_generation`, which counts this daemon's own head changes and compares only against itself |
 | `islands_changed` | `islands` |
 | `agent_register`, `agent_lost`, `agent_degraded`, `agent_dead`, `service_note` | `groups/<group>/agents/<agent_id>` |
@@ -750,6 +759,8 @@ events from an older `boot_id` starts again from the new snapshot.
 
 Each daemon replicates its own events to every live peer in `peer_event`.
 It delivers a peer's event to its own subscribers without re-forwarding it.
+`peer_records` is not replicated: each daemon derives it from the pushes it
+receives, so every peer would otherwise forward its copy to every other.
 A replicated event describes the originating node's snapshot. A receiving
 daemon's snapshot summarises its peers and does not hold their rows. A
 consumer therefore applies only events whose `node` is the daemon it is
@@ -765,6 +776,23 @@ Daemon, port 6380:
 | `/status` | The snapshot. `?group=` scopes it |
 | `/metrics` | Prometheus text |
 | `/events` | WebSocket: `{"type": "snapshot", "seq": N, "data": {...}}`, then events |
+| `PUT /records/<name>` | `204`. Stores the JSON body as this node's record `name` |
+| `DELETE /records/<name>` | `204`. Drops the record |
+
+Every other method is `405`. Only a loopback client may write a record, and
+any other gets `403`. A `PUT` body is exactly `Content-Length` bytes. One
+without the header, with `Transfer-Encoding`, or cut short is `400`. A name is 1 to 64 of `a-z`, `0-9`, `.`, `_` and `-`,
+else `400`, as is a body that is not JSON. All of a node's records together
+are at most 16384 bytes as JSON text, else `413`. The limit is part of the
+protocol, the same on every daemon, so a publisher can size its record
+against it, and changing it is a version change. A record changes at most
+once per `MENTAT_PEER_STATUS_INTERVAL_MS`, else `429`, since a peer sees only
+the value at each push. A `DELETE` is always taken, so a publisher that stops
+can drop its record at once. Removing a record starts the interval too, and
+deleting one that is not there changes nothing. A repeated header
+counts as one value with a comma between, so two `Content-Length`s are
+`400`. Storing the value already held is never refused and
+emits nothing. Records are soft state: a restarted daemon holds none.
 
 | Metric | Labels | Meaning |
 | --- | --- | --- |

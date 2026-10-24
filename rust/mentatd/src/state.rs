@@ -393,6 +393,11 @@ pub struct State {
     pub boot_id: String,
     /// Live WebSocket subscribers get every new event pushed.
     pub event_subs: Vec<std::sync::mpsc::Sender<String>>,
+    /// What local processes publish about this node through
+    /// `PUT /records/<name>`. The snapshot carries it to every peer.
+    pub records: std::collections::BTreeMap<String, Value>,
+    /// When each record name last changed, for the rate limit in http.rs.
+    pub records_changed: HashMap<String, std::time::Instant>,
 }
 
 pub struct Shared {
@@ -440,6 +445,8 @@ impl State {
             next_event_seq: 1,
             boot_id: mentat_common::secret::boot_id(),
             event_subs: Vec::new(),
+            records: std::collections::BTreeMap::new(),
+            records_changed: HashMap::new(),
         }
     }
 
@@ -469,7 +476,23 @@ impl State {
         self.emit(kind, fields);
     }
 
+    /// Like `emit_patch`, for a change each daemon derives on its own from
+    /// what the mesh already carries, such as a peer's records from its
+    /// push. It goes to this daemon's subscribers only, since replicating it
+    /// would send every peer's copy of it to every other peer.
+    pub fn emit_patch_local(&mut self, kind: &str, patch: Vec<Patch>, why: &str) {
+        let mut fields = json!({ "patch": patch });
+        if !why.is_empty() {
+            fields["why"] = why.into();
+        }
+        self.emit_to(kind, fields, false);
+    }
+
     pub fn emit(&mut self, kind: &str, fields: Value) {
+        self.emit_to(kind, fields, true);
+    }
+
+    fn emit_to(&mut self, kind: &str, fields: Value, replicate: bool) {
         let seq = self.next_event_seq;
         self.next_event_seq += 1;
         let ts_ms = std::time::SystemTime::now()
@@ -486,7 +509,7 @@ impl State {
         let line = data.to_string();
         mentat_common::logfmt::log("event", &[("data", line.clone())]);
         self.event_subs.retain(|tx| tx.send(line.clone()).is_ok());
-        for peer in self.peers.values() {
+        for peer in self.peers.values().filter(|_| replicate) {
             if peer.alive {
                 let _ = peer.writer.send(
                     crate::proto::Msg::PeerEvent {

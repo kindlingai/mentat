@@ -880,6 +880,7 @@ The daemon serves these on `--http-port`:
 | `/metrics` | Prometheus text |
 | `/events` | WebSocket: a snapshot, then one message per event |
 | `/healthz` | `ok` |
+| `PUT /records/<name>`, `DELETE /records/<name>` | Publish or drop a record about this node. Loopback only |
 
 PROTOCOL.md holds the event list and the path each one patches.
 
@@ -888,6 +889,39 @@ curl -s http://<node>:6380/status | jq .
 curl -s http://<node>:6380/metrics
 websocat ws://<node>:6380/events
 ```
+
+### Peers and records
+
+A process on a box finds the other boxes through its own daemon, with no
+configuration but the port. `GET /status` holds the peer table under
+`peers`, keyed by node id. Each row has `node_ip` (what the box calls
+itself), `link_ip` (the address this daemon's link to it uses, so one this
+box can reach), `addrs` (every address it listens on) and `alive`. The table
+lists the other boxes only. This box is the top-level `node_id`.
+
+A process publishes a small record about its box under a name of its own:
+
+```
+curl -X PUT --data '{"port": 7762, "holdings": ["org/model@rev"]}' \
+  http://127.0.0.1:6380/records/model-loader
+curl -X DELETE http://127.0.0.1:6380/records/model-loader
+```
+
+The body is any JSON value. The daemon serves the box's records as the
+top-level `records` of `/status`. It sends them to every peer with each
+status push, and every peer shows them as `records` on this box's row,
+within one `MENTAT_PEER_STATUS_INTERVAL_MS`. Only a process on this box may
+write, as the port has no authentication. All of a box's records together
+are at most 16 KiB of JSON (`413`), a fixed protocol limit. Each record is
+set at most once per `MENTAT_PEER_STATUS_INTERVAL_MS` (`429`), as a peer
+sees only the value at each push. A delete is always taken.
+The mesh carries a summary. Bulk data goes over the publisher's own port.
+
+Records are soft state. A restarted daemon holds none, and a stopped
+publisher's record stays until it is deleted. A publisher re-sends its record
+on a timer, which costs nothing while it is unchanged. A reader checks that
+the publisher answers before it relies on the record. A dead peer's row keeps
+its last records with `alive` false.
 
 ## Diagnostics
 

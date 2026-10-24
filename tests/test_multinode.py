@@ -15,9 +15,12 @@ itself the test that those knobs work.
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -132,6 +135,77 @@ def t02b_probes_cover_each_address_pair():
     # be a fabric before testing which ones work.
     tags = d1.status_json()["peers"][d2_id]["addr_tags"]
     assert tags[BOGUS] == ["connectx", "rdma"], tags
+
+
+def put_record(d, name, value=None):
+    """PUT (or, for None, DELETE) d's record `name`. The HTTP status."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{d.http_port}/records/{name}",
+        data=None if value is None else json.dumps(value).encode(),
+        method="DELETE" if value is None else "PUT",
+    )
+    try:
+        return urllib.request.urlopen(req, timeout=5).status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def t02c_a_record_put_on_one_node_reads_on_the_others():
+    """A local process publishes a record on its own daemon, and every other
+    daemon's /status shows it on that node's peer row, beside its addresses
+    and liveness: what model-loader reads to find its peers."""
+    d1, d2, d3 = state["d1"], state["d2"], state["d3"]
+    d1_id = state["d1_id"]
+    rec = {"port": 7762, "holdings": ["org/model@abc123"]}
+    assert put_record(d1, "model-loader", rec) == 204
+    # Repeating the record is free. Changing it again within one status
+    # push interval is refused.
+    assert put_record(d1, "model-loader", rec) == 204
+    assert put_record(d1, "model-loader", {"port": 1}) == 429
+    assert put_record(d1, "Model-Loader", rec) == 400
+    # A delete is taken at once, and a set right after it waits.
+    assert put_record(d1, "gone") == 204
+    assert put_record(d1, "scratch", 1) == 204
+    assert put_record(d1, "scratch") == 204
+    assert put_record(d1, "scratch", 2) == 429
+    assert put_record(d1, "big", "x" * 20000) == 413
+    assert d1.status_json()["records"] == {"model-loader": rec}
+    for d in (d2, d3):
+        wait_for(lambda: d.status_json()["peers"][d1_id]["records"]
+                 == {"model-loader": rec}, 10, "the record to reach a peer")
+
+    # A body is taken only at its exact Content-Length: a short one or a
+    # chunked one is refused, not stored as whatever arrived.
+    for raw in (
+        b"PUT /records/short HTTP/1.1\r\nContent-Length: 100\r\n\r\n12",
+        b"PUT /records/chunked HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n12\r\n0\r\n\r\n",
+        b"PUT /records/nolength HTTP/1.1\r\n\r\n12",
+        b"PUT /records/dup HTTP/1.1\r\nContent-Length: 100\r\nContent-Length: 2\r\n\r\n12",
+        b"PUT /records/dup HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 100\r\n\r\n12",
+    ):
+        with socket.create_connection(("127.0.0.1", d1.http_port), timeout=15) as c:
+            c.sendall(raw)
+            c.shutdown(socket.SHUT_WR)
+            assert c.recv(64).startswith(b"HTTP/1.1 400"), raw
+    assert d1.status_json()["records"] == {"model-loader": rec}
+
+    # Each daemon derives peer_records from the pushes it gets and tells its
+    # own subscribers only. Replicated, every peer's copy would reach every
+    # other peer.
+    d2_id, d3_id = (d.status_json()["node_id"] for d in (d2, d3))
+    stream = tl.EventStream(d3.http_port)
+    stream.frame(5)  # the snapshot
+    assert put_record(d1, "model-loader") == 204
+    seen = set()
+    for evt in stream.events(time.time() + 3):
+        if evt["type"] in ("record_changed", "peer_records"):
+            seen.add((evt["type"], evt["node"]))
+    stream.close()
+    assert ("record_changed", d1_id) in seen, seen
+    assert ("peer_records", d3_id) in seen, seen
+    assert ("peer_records", d2_id) not in seen, seen
+    wait_for(lambda: d2.status_json()["peers"][d1_id]["records"] == {},
+             10, "the removal to reach a peer")
 
 
 def t03_a_group_registered_anywhere_lands_on_the_head():
@@ -446,6 +520,7 @@ def main():
         t01_workers_first_then_head,
         t02_a_later_lower_id_adopts_the_settled_head,
         t02b_probes_cover_each_address_pair,
+        t02c_a_record_put_on_one_node_reads_on_the_others,
         t03_a_group_registered_anywhere_lands_on_the_head,
         t04_events_stream_carries_head_change,
         t05_group_survived_head_change,
