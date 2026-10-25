@@ -2382,7 +2382,13 @@ fn claim_order(
     let [set] = req.sets.as_slice() else {
         return None;
     };
-    if !set.layout.ordered() {
+    // An `any` set places as what it resolved to. A mesh or hops answer has
+    // no order.
+    let layout = match set.layout {
+        Layout::Any => Layout::parse(c.view["layouts"][&set.name].as_str()?).ok()?,
+        l => l,
+    };
+    if !layout.ordered() {
         return None;
     }
     let mut order: Vec<(String, Value)> = c.view["sets"][&set.name]
@@ -2396,10 +2402,7 @@ fn claim_order(
         })
         .collect();
     let last = order.len().saturating_sub(1);
-    match (
-        set.layout,
-        order.iter().position(|(n, ..)| n == driver_node),
-    ) {
+    match (layout, order.iter().position(|(n, ..)| n == driver_node)) {
         (Layout::Ring, Some(i)) => order.rotate_left(i),
         (Layout::Line, Some(i)) if i == last && i > 0 => {
             order.reverse();
@@ -2431,7 +2434,7 @@ fn claim_order(
     Some(Ok(order
         .into_iter()
         .enumerate()
-        .map(|(i, (n, m))| (n, rank_env(set.layout, &m, i, size)))
+        .map(|(i, (n, m))| (n, rank_env(layout, &m, i, size)))
         .collect()))
 }
 
@@ -3468,6 +3471,25 @@ mod tests {
         let st = with_star_claim(&["nB", "nA", "nC"]);
         let e = claim_order(&st, "g", "c", "nC").unwrap().unwrap_err();
         assert!(e.contains("hub on nb"), "{e}");
+    }
+
+    /// An `any` claim places as what it resolved to: a ring turns to the
+    /// driver, and a mesh or hops answer pools.
+    #[test]
+    fn an_any_claim_places_as_its_answer() {
+        let mut st = with_ordered_claim("ring", &["nA", "nB", "nC", "nD"]);
+        let c = st.claims.get_mut(&("g".into(), "c".into())).unwrap();
+        c.shape = crate::claim::canonical(&json!({"sets": [{"name": "tp", "bundles": [1, 1, 1, 1],
+                                                             "link": "rdma", "layout": "any"}]}));
+        c.view["layouts"] = json!({"tp": "ring"});
+        let order = claim_order(&st, "g", "c", "nC").unwrap().unwrap();
+        assert_eq!(ranks(&order), ["nC", "nD", "nA", "nB"]);
+        assert_eq!(order[0].1["MENTAT_FABRIC_LAYOUT"], "ring");
+        for pooled in ["mesh", "hops"] {
+            let c = st.claims.get_mut(&("g".into(), "c".into())).unwrap();
+            c.view["layouts"] = json!({ "tp": pooled });
+            assert!(claim_order(&st, "g", "c", "nC").is_none(), "{pooled}");
+        }
     }
 
     /// A mesh claim keeps its pooled placement.

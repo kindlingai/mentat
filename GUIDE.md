@@ -480,7 +480,7 @@ The shim reads `MENTAT_CLAIM` and `MENTAT_CLAIM_SHAPE` at
 the claim. A group requesting more than its claim holds stays PENDING.
 [PROTOCOL.md](PROTOCOL.md) defines the shape.
 
-A set's layout is `mesh`, `ring`, `line` or `star`. A mesh is one island. A
+A set's layout is `mesh`, `ring`, `line`, `star` or `any`. A mesh is one island. A
 ring, a line or a star is built from probed cables. Four boxes cabled in a
 loop can host a four-rank ring, though no island has four members. A star is
 a hub with a cable to every other member, so every rank is one hop from the
@@ -516,6 +516,23 @@ roots. A set's `ports` picks the rule:
 | `same` | On one port, or the claim is refused |
 
 `MENTAT_CLAIM_PORTS` sets it without writing a shape.
+
+An `any` set takes the first of mesh, ring, star and line that fits.
+Failing all four, it takes members that each reach every other directly or
+through one other member, a `hops` answer. A star counts only with its hub
+on the driver's node, and a line only with the driver at one end, where
+the driver is a member, since placement refuses the others. Six boxes on a
+switch with a seventh cabled to one of them are no mesh and no ring of
+seven. They are a star with its hub on the seventh box's neighbour, or,
+with the driver elsewhere, a line from the seventh box to the driver. The view's
+`layouts` says what each `any` set became. A ring, star or line answer
+places in order and gives each rank its neighbours, like a claim of that
+layout. A mesh or hops answer places among its members in no order. `max_hops` is 1, and any other value is refused for now.
+
+A ring, line, star or any claim's view also lists every link between two
+members and the fewest-hop paths between members with no link
+(PROTOCOL.md, "claim"). A caller with its own rules for which link carries
+what, such as a relay over a second PCI root, reads them there.
 
 ## Environment
 
@@ -772,7 +789,7 @@ The shape to claim, as JSON. Invalid JSON raises at
 
 - `MENTAT_CLAIM_LAYOUT` (default: `mesh`)
 
-The layout of the default shape's set: `mesh`, `ring`, `line` or `star`. Ignored
+The layout of the default shape's set: `mesh`, `ring`, `line`, `star` or `any`. Ignored
 when `MENTAT_CLAIM_SHAPE` is set, since that shape names its own. See
 "Claims".
 

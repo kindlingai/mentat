@@ -40,6 +40,12 @@ pub enum Layout {
     Line,
     /// The first member, the hub, links to every other.
     Star,
+    /// The first of mesh, ring, star and line that fits, else `Hops`.
+    Any,
+    /// What `Any` falls back to: every member links to every other, or
+    /// reaches it through at most `max_hops` other members. A request
+    /// cannot name it.
+    Hops,
 }
 
 impl Layout {
@@ -49,15 +55,16 @@ impl Layout {
             "ring" => Ok(Layout::Ring),
             "line" => Ok(Layout::Line),
             "star" => Ok(Layout::Star),
+            "any" => Ok(Layout::Any),
             other => Err(format!(
-                "unknown layout {other:?}, expected mesh, ring, line or star"
+                "unknown layout {other:?}, expected mesh, ring, line, star or any"
             )),
         }
     }
 
     /// Whether the members come in an order that placement keeps.
     pub fn ordered(self) -> bool {
-        self != Layout::Mesh
+        matches!(self, Layout::Ring | Layout::Line | Layout::Star)
     }
 
     pub fn name(self) -> &'static str {
@@ -66,6 +73,8 @@ impl Layout {
             Layout::Ring => "ring",
             Layout::Line => "line",
             Layout::Star => "star",
+            Layout::Any => "any",
+            Layout::Hops => "hops",
         }
     }
 }
@@ -147,6 +156,9 @@ pub struct SetReq {
     pub link: Link,
     pub layout: Layout,
     pub ports: Ports,
+    /// For an `any` set, how many other members a fallback member may
+    /// reach another through.
+    pub max_hops: usize,
     /// Pins the set to one GPU vendor. Empty lets the daemon pick one, and
     /// it still picks only one: no collective spans vendors.
     pub vendor: String,
@@ -360,6 +372,140 @@ pub struct Member {
 pub struct Solution {
     pub sets: BTreeMap<String, Vec<Member>>,
     pub between: Vec<Path>,
+    /// For each ring, line, star or any set, the links and paths among
+    /// its members.
+    pub facts: BTreeMap<String, Facts>,
+    /// What each `any` set was placed as.
+    pub layouts: BTreeMap<String, Layout>,
+}
+
+/// What a caller needs to apply its own policy to a ring, line or star:
+/// every link between two members, and the fewest-hop paths between
+/// members with no link. Nothing here depends on the layout's order or on
+/// `ports`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Facts {
+    /// Every probed, non-forwarded link between two members that meets the
+    /// set's `link`, once each, with `a` the lower node id.
+    pub links: Vec<LinkFact>,
+    /// For each ordered pair of members with no link, every fewest-hop path
+    /// through the set's members, as node ids from the first to the last.
+    pub paths: BTreeMap<NodeId, BTreeMap<NodeId, Vec<Vec<NodeId>>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkFact {
+    pub a: NodeId,
+    pub b: NodeId,
+    pub a_port: Port,
+    pub b_port: Port,
+    /// Each end's port group, named by the lowest address in it.
+    pub a_group: String,
+    pub b_group: String,
+    pub rtt_ms: u64,
+}
+
+/// A pair of members has at most this many paths listed. Dense sets have
+/// few pairs without a link, but the count of tied paths grows with the
+/// product of the degrees along them.
+const MAX_PATHS: usize = 64;
+
+/// The path walk for one pair stops after this many partial paths. A walk
+/// that keeps to fewest-hop steps stays far below it. The head builds paths
+/// holding its state lock, so this bounds the cost of a fault there.
+const MAX_PATH_STEPS: usize = 100_000;
+
+/// The links and paths among `nodes`.
+fn facts(t: &Topology, set: &SetReq, groups: &BTreeMap<String, String>, nodes: &[NodeId]) -> Facts {
+    let mut members: Vec<&NodeId> = nodes.iter().collect();
+    members.sort();
+    let group = |p: &Port| {
+        groups
+            .get(&p.addr)
+            .cloned()
+            .unwrap_or_else(|| p.addr.clone())
+    };
+    let mut links = Vec::new();
+    let mut linked: BTreeMap<&NodeId, BTreeSet<&NodeId>> = BTreeMap::new();
+    for (i, &a) in members.iter().enumerate() {
+        for &b in &members[i + 1..] {
+            let mut found = t.paths(a, b, set.link, true);
+            found.sort_by(|p, q| {
+                (&p.local.addr, &p.remote.addr).cmp(&(&q.local.addr, &q.remote.addr))
+            });
+            if !found.is_empty() {
+                linked.entry(a).or_default().insert(b);
+                linked.entry(b).or_default().insert(a);
+            }
+            links.extend(found.into_iter().map(|p| LinkFact {
+                a: a.clone(),
+                b: b.clone(),
+                a_group: group(&p.local),
+                b_group: group(&p.remote),
+                a_port: p.local,
+                b_port: p.remote,
+                rtt_ms: p.rtt_ms,
+            }));
+        }
+    }
+    let mut paths: BTreeMap<NodeId, BTreeMap<NodeId, Vec<Vec<NodeId>>>> = BTreeMap::new();
+    let empty = BTreeSet::new();
+    let next = |n: &NodeId| linked.get(n).unwrap_or(&empty);
+    for &from in &members {
+        // Hops from `from` to each member it reaches.
+        let mut dist: BTreeMap<&NodeId, usize> = BTreeMap::from([(from, 0)]);
+        let mut frontier = vec![from];
+        while !frontier.is_empty() {
+            let mut more = Vec::new();
+            for n in frontier {
+                for m in next(n) {
+                    if !dist.contains_key(m) {
+                        dist.insert(m, dist[n] + 1);
+                        more.push(*m);
+                    }
+                }
+            }
+            frontier = more;
+        }
+        for &to in &members {
+            if to == from || next(from).contains(to) || !dist.contains_key(to) {
+                continue;
+            }
+            // Walk back from `to` along members one hop nearer `from`, so
+            // only fewest-hop paths are built, in node id order.
+            let mut found: Vec<Vec<NodeId>> = Vec::new();
+            let mut stack: Vec<Vec<&NodeId>> = vec![vec![to]];
+            let mut steps = 0;
+            while let Some(tail) = stack.pop() {
+                steps += 1;
+                if found.len() >= MAX_PATHS || steps > MAX_PATH_STEPS {
+                    break;
+                }
+                let head = tail[tail.len() - 1];
+                if head == from {
+                    found.push(tail.iter().rev().map(|n| (*n).clone()).collect());
+                    continue;
+                }
+                let step = dist[head] - 1;
+                let back: Vec<&NodeId> = next(head)
+                    .iter()
+                    .copied()
+                    .filter(|m| dist.get(m) == Some(&step))
+                    .collect();
+                for m in back.into_iter().rev() {
+                    let mut longer = tail.clone();
+                    longer.push(m);
+                    stack.push(longer);
+                }
+            }
+            found.sort();
+            paths
+                .entry(from.clone())
+                .or_default()
+                .insert(to.clone(), found);
+        }
+    }
+    Facts { links, paths }
 }
 
 impl Solution {
@@ -410,6 +556,30 @@ impl Solution {
                 of_set.insert(m.node.clone(), k.clone());
             }
         }
+        let end = |n: &NodeId, p: &Port, g: &String| json!({"node": n, "host": name(n), "addr": p.addr, "iface": p.iface, "port": g});
+        let links: BTreeMap<&String, Vec<Value>> = self
+            .facts
+            .iter()
+            .map(|(k, f)| {
+                let rows = f
+                    .links
+                    .iter()
+                    .map(|l| {
+                        json!({
+                            "a": end(&l.a, &l.a_port, &l.a_group),
+                            "b": end(&l.b, &l.b_port, &l.b_group),
+                            "rtt_ms": l.rtt_ms,
+                        })
+                    })
+                    .collect();
+                (k, rows)
+            })
+            .collect();
+        let paths: BTreeMap<&String, Value> = self
+            .facts
+            .iter()
+            .map(|(k, f)| (k, json!(f.paths)))
+            .collect();
         json!({
             "sets": sets,
             "between": self
@@ -417,6 +587,13 @@ impl Solution {
                 .iter()
                 .map(|p| p.to_json(&t.hosts, &of_set))
                 .collect::<Vec<_>>(),
+            "links": links,
+            "paths": paths,
+            "layouts": self
+                .layouts
+                .iter()
+                .map(|(k, l)| (k.clone(), l.name()))
+                .collect::<BTreeMap<_, _>>(),
         })
     }
 }
@@ -427,6 +604,9 @@ impl Solution {
 struct Cand {
     nodes: Vec<NodeId>,
     links: Vec<Path>,
+    /// What the set was placed as. An `any` set resolves to one of mesh,
+    /// ring, line or hops.
+    layout: Layout,
 }
 
 /// Candidate node groups for a set, best first.
@@ -440,13 +620,54 @@ struct Cand {
 /// member's two links across ports first. Four boxes on a switch and cabled
 /// in pairs then ring over the cables and the switch in turn, with each box
 /// using both ports.
+/// With `first`, a ring or line starts only at that node.
 fn candidates(
     t: &Topology,
     set: &SetReq,
     groups: &BTreeMap<String, String>,
     taken: &BTreeSet<NodeId>,
     driver: Option<&NodeId>,
+    first: Option<&NodeId>,
 ) -> Vec<Cand> {
+    if set.layout == Layout::Any {
+        // Placement leaves a star pending with the driver on a leaf, and a
+        // line with the driver inside it, so neither counts then.
+        let places = |c: &Cand| {
+            let Some(at) = driver.and_then(|d| c.nodes.iter().position(|n| n == d)) else {
+                return true;
+            };
+            match c.layout {
+                Layout::Star => at == 0,
+                Layout::Line => at == 0 || at + 1 == c.nodes.len(),
+                _ => true,
+            }
+        };
+        // A line search stops at MAX_CHAINS answers. All of them can hold
+        // the driver inside, so lines that start at the driver come first.
+        let mut passes = vec![
+            (Layout::Mesh, None),
+            (Layout::Ring, None),
+            (Layout::Star, None),
+        ];
+        if driver.is_some() {
+            passes.push((Layout::Line, driver));
+        }
+        passes.push((Layout::Line, None));
+        let mut out: Vec<Cand> = Vec::new();
+        for (layout, first) in passes {
+            let as_layout = SetReq {
+                layout,
+                ..set.clone()
+            };
+            for c in candidates(t, &as_layout, groups, taken, driver, first) {
+                if places(&c) && !out.contains(&c) {
+                    out.push(c);
+                }
+            }
+        }
+        out.extend(hops(t, set, taken));
+        return out;
+    }
     if set.layout.ordered() {
         let nodes: Vec<&NodeId> = t.free_gpus.keys().filter(|n| !taken.contains(*n)).collect();
         if set.layout == Layout::Star {
@@ -457,6 +678,7 @@ fn candidates(
                 .map(|nodes| Cand {
                     nodes,
                     links: Vec::new(),
+                    layout: Layout::Star,
                 })
                 .collect();
         }
@@ -473,6 +695,7 @@ fn candidates(
                 set,
                 groups,
                 rule,
+                first,
                 steps: std::cell::Cell::new(0),
             };
             let nodes = if rule == Rule::Split && set.layout == Layout::Ring {
@@ -529,6 +752,7 @@ fn candidates(
                 .map(|nodes| Cand {
                     nodes,
                     links: Vec::new(),
+                    layout: Layout::Mesh,
                 })
                 .collect()
         }
@@ -546,12 +770,76 @@ fn candidates(
                 vec![Cand {
                     nodes: chosen,
                     links: Vec::new(),
+                    layout: Layout::Mesh,
                 }]
             } else {
                 Vec::new()
             }
         }
     }
+}
+
+/// The node sets for an `any` set's fallback: `want` free nodes, each
+/// linked over a cable to every other or reaching it through at most
+/// `max_hops` other members. Sets come in node id order.
+fn hops(t: &Topology, set: &SetReq, taken: &BTreeSet<NodeId>) -> Vec<Cand> {
+    let want = set.bundles.len();
+    let nodes: Vec<&NodeId> = t.free_gpus.keys().filter(|n| !taken.contains(*n)).collect();
+    let mut out = Vec::new();
+    if want == 0 || want > nodes.len() {
+        return out;
+    }
+    let linked = |a: &NodeId, b: &NodeId| t.path(a, b, set.link, true).is_some();
+    // Whether every member reaches every other within max_hops + 1 links,
+    // stepping through members only.
+    let close = |members: &[&NodeId]| {
+        members.iter().all(|&from| {
+            let mut seen: BTreeSet<&NodeId> = BTreeSet::from([from]);
+            let mut frontier = vec![from];
+            for _ in 0..=set.max_hops {
+                let mut more = Vec::new();
+                for n in frontier {
+                    for &m in members {
+                        if !seen.contains(m) && linked(n, m) {
+                            seen.insert(m);
+                            more.push(m);
+                        }
+                    }
+                }
+                frontier = more;
+            }
+            seen.len() == members.len()
+        })
+    };
+    let mut steps = 0;
+    let mut pick: Vec<usize> = (0..want).collect();
+    loop {
+        steps += 1;
+        if steps > MAX_STEPS || out.len() >= MAX_CHAINS {
+            break;
+        }
+        let members: Vec<&NodeId> = pick.iter().map(|&i| nodes[i]).collect();
+        let fits = members
+            .iter()
+            .zip(&set.bundles)
+            .all(|(n, b)| t.free_gpus.get(*n).copied().unwrap_or(0.0) >= *b);
+        if fits && close(&members) {
+            out.push(Cand {
+                nodes: members.into_iter().cloned().collect(),
+                links: Vec::new(),
+                layout: Layout::Hops,
+            });
+        }
+        // The next combination in order.
+        let Some(i) = (0..want).rev().find(|&i| pick[i] < nodes.len() - want + i) else {
+            break;
+        };
+        pick[i] += 1;
+        for j in i + 1..want {
+            pick[j] = pick[j - 1] + 1;
+        }
+    }
+    out
 }
 
 /// A ring, line or star search stops after this many answers. Each is a
@@ -701,6 +989,8 @@ struct Walk<'t> {
     set: &'t SetReq,
     groups: &'t BTreeMap<String, String>,
     rule: Rule,
+    /// The only node a chain may start at, when given.
+    first: Option<&'t NodeId>,
     steps: std::cell::Cell<usize>,
 }
 
@@ -827,6 +1117,7 @@ impl Walk<'_> {
                 out.push(Cand {
                     nodes: chain.iter().map(|n| (*n).clone()).collect(),
                     links,
+                    layout: self.set.layout,
                 });
             }
             return;
@@ -836,6 +1127,9 @@ impl Walk<'_> {
             if chain.contains(&n)
                 || self.t.free_gpus.get(n).copied().unwrap_or(0.0) < set.bundles[i]
             {
+                continue;
+            }
+            if chain.is_empty() && self.first.is_some_and(|f| f != n) {
                 continue;
             }
             if set.layout == Layout::Ring && chain.first().is_some_and(|first| n < *first) {
@@ -915,13 +1209,16 @@ fn spokes<'a>(
 }
 
 /// In a star, a leaf's link to the hub, or the hub's link to each leaf.
+/// `layout` is what the set was placed as, which for an `any` set differs
+/// from its request.
 fn star_links(
     t: &Topology,
     set: &SetReq,
+    layout: Layout,
     nodes: &[NodeId],
     i: usize,
 ) -> Result<(Option<Path>, Vec<Path>), String> {
-    if set.layout != Layout::Star {
+    if layout != Layout::Star {
         return Ok((None, Vec::new()));
     }
     let link = |j: usize| {
@@ -964,6 +1261,34 @@ fn bind_for(t: &Topology, set: &SetReq, node: &NodeId, peers: &[NodeId]) -> Opti
     }
 }
 
+/// The port of `node` with a cable to the most other members, the first
+/// such port on a tie.
+fn bind_hops(t: &Topology, set: &SetReq, node: &NodeId, members: &[NodeId]) -> Option<Port> {
+    let ports = t.ports.get(node)?;
+    let reach = |p: &Port| {
+        members
+            .iter()
+            .filter(|m| *m != node)
+            .filter(|m| {
+                t.paths(node, m, set.link, true)
+                    .iter()
+                    .any(|q| q.local.addr == p.addr)
+            })
+            .count()
+    };
+    let mut best: Option<(&Port, usize)> = None;
+    for p in ports {
+        if set.link == Link::Rdma && !p.rdma() {
+            continue;
+        }
+        let n = reach(p);
+        if best.is_none_or(|(_, b)| n > b) {
+            best = Some((p, n));
+        }
+    }
+    best.map(|(p, _)| p.clone())
+}
+
 /// Match a request against the topology.
 ///
 /// Sets are placed in the order given, with `rdma` sets first: they have the
@@ -1000,11 +1325,15 @@ pub fn solve(t: &Topology, req: &Request) -> Result<Solution, String> {
 
     let mut sets: BTreeMap<String, Vec<Member>> = BTreeMap::new();
     for s in &req.sets {
-        let Cand { nodes, links } = &chosen[&s.name];
+        let Cand {
+            nodes,
+            links,
+            layout,
+        } = &chosen[&s.name];
         let k = nodes.len();
         let mut members = Vec::new();
         for (i, n) in nodes.iter().enumerate() {
-            let (prev, next) = match s.layout {
+            let (prev, next) = match layout {
                 Layout::Ring if k > 1 => (
                     Some(links[(i + k - 1) % k].reversed()),
                     Some(links[i].clone()),
@@ -1015,15 +1344,19 @@ pub fn solve(t: &Topology, req: &Request) -> Result<Solution, String> {
                 ),
                 _ => (None, None),
             };
-            let (hub, leaves) = star_links(t, s, nodes, i)?;
+            let (hub, leaves) = star_links(t, s, *layout, nodes, i)?;
             // A ring or line member binds the port toward its next member,
             // and a line's last member the port toward its previous one. A
             // star's leaf binds the port toward the hub, and the hub the port
             // toward its first leaf.
             let toward = next.as_ref().or(prev.as_ref()).or(hub.as_ref());
-            let bind = match toward.or(leaves.first()) {
-                Some(p) => p.local.clone(),
-                None => bind_for(t, s, n, nodes)
+            // A hops member reaches some members only through others, so it
+            // binds the port linking it to the most of them.
+            let bind = match (toward.or(leaves.first()), layout) {
+                (Some(p), _) => p.local.clone(),
+                (None, Layout::Hops) => bind_hops(t, s, n, nodes)
+                    .ok_or_else(|| format!("{n} has no address for set {:?}", s.name))?,
+                (None, _) => bind_for(t, s, n, nodes)
                     .ok_or_else(|| format!("{n} has no address for set {:?}", s.name))?,
             };
             members.push(Member {
@@ -1044,7 +1377,24 @@ pub fn solve(t: &Topology, req: &Request) -> Result<Solution, String> {
     }
     let between =
         paths_between(t, req, &chosen).ok_or("no probed link satisfies a between entry")?;
-    Ok(Solution { sets, between })
+    let facts = req
+        .sets
+        .iter()
+        .filter(|s| s.layout.ordered() || s.layout == Layout::Any)
+        .map(|s| (s.name.clone(), facts(t, s, &groups, &chosen[&s.name].nodes)))
+        .collect();
+    let layouts = req
+        .sets
+        .iter()
+        .filter(|s| s.layout == Layout::Any)
+        .map(|s| (s.name.clone(), chosen[&s.name].layout))
+        .collect();
+    Ok(Solution {
+        sets,
+        between,
+        facts,
+        layouts,
+    })
 }
 
 fn search(
@@ -1060,7 +1410,7 @@ fn search(
         return paths_between(t, req, chosen).is_some();
     }
     let set = order[i];
-    for cand in candidates(t, set, groups, taken, req.driver.as_ref()) {
+    for cand in candidates(t, set, groups, taken, req.driver.as_ref(), None) {
         for n in &cand.nodes {
             taken.insert(n.clone());
         }
@@ -1113,6 +1463,21 @@ fn why_not(t: &Topology, req: &Request) -> String {
     let mut parts = Vec::new();
     for s in &req.sets {
         let want = s.bundles.len();
+        if s.layout == Layout::Any {
+            parts.push(format!(
+                "set {:?} wants any layout of {want} nodes over {} links: no island \
+                 holds them, no ring, star or line of cables joins them, and no {want} \
+                 free nodes each reach every other through at most {} others",
+                s.name,
+                if s.link == Link::Rdma {
+                    "rdma"
+                } else {
+                    "probed"
+                },
+                s.max_hops,
+            ));
+            continue;
+        }
         if s.layout.ordered() {
             let how = match (s.layout, s.ports) {
                 (Layout::Star, _) => "a hub cabled to each of the others",
@@ -1202,15 +1567,31 @@ pub fn parse(shape: &Value) -> Result<Request, String> {
             };
             let layout = Layout::parse(s["layout"].as_str().unwrap_or("mesh"))?;
             let ports = Ports::parse(s["ports"].as_str().unwrap_or("auto"))?;
-            if ports != Ports::Auto && !matches!(layout, Layout::Ring | Layout::Line) {
-                return Err(format!("set {name:?}: ports applies to a ring or a line"));
+            if ports != Ports::Auto && !matches!(layout, Layout::Ring | Layout::Line | Layout::Any)
+            {
+                return Err(format!(
+                    "set {name:?}: ports applies to a ring, a line or any"
+                ));
             }
+            // Only one hop for now. A longer path relays through more boxes
+            // whose ports carry their own ranks' traffic.
+            let max_hops = match &s["max_hops"] {
+                Value::Null => 1,
+                v if layout != Layout::Any => {
+                    return Err(format!(
+                        "set {name:?}: max_hops applies to an any layout, got {v}"
+                    ))
+                }
+                v if v.as_u64() == Some(1) => 1,
+                v => return Err(format!("set {name:?}: max_hops must be 1 for now, got {v}")),
+            };
             Ok(SetReq {
                 name,
                 bundles,
                 link: Link::parse(s["link"].as_str().unwrap_or("ip"))?,
                 layout,
                 ports,
+                max_hops,
                 vendor: s["vendor"].as_str().unwrap_or_default().to_string(),
             })
         })
@@ -1445,6 +1826,7 @@ mod tests {
                     link: *l,
                     layout: Layout::Mesh,
                     ports: Ports::Auto,
+                    max_hops: 1,
                     vendor: String::new(),
                 })
                 .collect(),
@@ -1899,6 +2281,519 @@ mod tests {
         r.sets[0].ports = Ports::Split;
         let s = solve(&t, &r).unwrap();
         assert_eq!(order(&s, "tp"), ["nA", "nB"]);
+    }
+
+    /// Four boxes in a switchless ring. Box i's first port is cabled to box
+    /// i+1's second, and each port shows two PCI roots with a subnet per
+    /// root and cable.
+    fn spark_ring() -> Topology {
+        let mut t = Topology::default();
+        for i in 0..4 {
+            let prev = (i + 3) % 4;
+            let mut ports = Vec::new();
+            for r in 0..2 {
+                ports.push(port(
+                    &format!("10.{}.{i}.1", 100 + r),
+                    &format!("f0r{r}"),
+                    &["rdma"],
+                ));
+                ports.push(port(
+                    &format!("10.{}.{prev}.2", 100 + r),
+                    &format!("f1r{r}"),
+                    &["rdma"],
+                ));
+            }
+            t.ports.insert(format!("n{i}"), ports);
+            t.free_gpus.insert(format!("n{i}"), 1.0);
+        }
+        for i in 0..4 {
+            for r in 0..2 {
+                t.links.insert(
+                    (
+                        format!("10.{}.{i}.1", 100 + r),
+                        format!("10.{}.{i}.2", 100 + r),
+                    ),
+                    0,
+                );
+            }
+        }
+        t
+    }
+
+    fn linked_pairs(f: &Facts) -> BTreeMap<(String, String), usize> {
+        let mut out = BTreeMap::new();
+        for l in &f.links {
+            *out.entry((l.a.clone(), l.b.clone())).or_default() += 1;
+        }
+        out
+    }
+
+    fn path(nodes: &[&str]) -> Vec<String> {
+        nodes.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Each cable holds two links on different ports at both ends, one per
+    /// root, and the opposite box is two hops away either way round.
+    #[test]
+    fn a_spark_ring_lists_both_roots_and_both_ways_round() {
+        let t = spark_ring();
+        let s = solve(&t, &laid_out("tp", 4, Layout::Ring)).unwrap();
+        let f = &s.facts["tp"];
+        let pairs = linked_pairs(f);
+        let want: BTreeMap<(String, String), usize> =
+            [("n0", "n1"), ("n0", "n3"), ("n1", "n2"), ("n2", "n3")]
+                .iter()
+                .map(|(a, b)| ((a.to_string(), b.to_string()), 2))
+                .collect();
+        assert_eq!(pairs, want);
+        for (a, b) in want.keys() {
+            let both: Vec<&LinkFact> = f.links.iter().filter(|l| (&l.a, &l.b) == (a, b)).collect();
+            assert_ne!(both[0].a_group, both[1].a_group, "{both:?}");
+            assert_ne!(both[0].b_group, both[1].b_group, "{both:?}");
+        }
+        assert_eq!(
+            f.paths["n0"]["n2"],
+            vec![path(&["n0", "n1", "n2"]), path(&["n0", "n3", "n2"])]
+        );
+        assert_eq!(f.paths["n1"].keys().collect::<Vec<_>>(), ["n3"]);
+        let v = s.to_json(&t);
+        assert_eq!(v["links"]["tp"].as_array().unwrap().len(), 8);
+        assert_eq!(
+            v["links"]["tp"][0]["a"]["port"],
+            v["links"]["tp"][0]["a"]["addr"]
+        );
+        assert_eq!(v["paths"]["tp"]["n0"]["n2"][1], json!(["n0", "n3", "n2"]));
+    }
+
+    /// The facts depend on the members and the probes alone, so a star's
+    /// driver and a ring's `ports` leave them as they are.
+    #[test]
+    fn facts_ignore_the_order_and_the_ports_rule() {
+        let t = spark_ring();
+        let mut r = laid_out("tp", 4, Layout::Ring);
+        let auto = solve(&t, &r).unwrap().facts;
+        r.sets[0].ports = Ports::Split;
+        assert_eq!(solve(&t, &r).unwrap().facts, auto);
+        let line = solve(&t, &laid_out("tp", 4, Layout::Line)).unwrap().facts;
+        assert_eq!(line["tp"], auto["tp"]);
+    }
+
+    /// The basement: A to F on a switch, cables A-B and F-G. With GPUs free
+    /// only on G, F, C and D, a line of four ends at G. Every switch box
+    /// reaches every other directly, so only G's pairs have paths, all
+    /// through F.
+    #[test]
+    fn a_line_off_a_switch_has_paths_only_through_its_cable() {
+        let mut t = switch_with_two_cables();
+        for n in ["nA", "nB", "nE"] {
+            t.free_gpus.insert(n.into(), 0.0);
+        }
+        let s = solve(&t, &laid_out("pp", 4, Layout::Line)).unwrap();
+        let f = &s.facts["pp"];
+        let pairs: Vec<(String, String)> = linked_pairs(f).into_keys().collect();
+        let want: Vec<(String, String)> = [("nC", "nD"), ("nC", "nF"), ("nD", "nF"), ("nF", "nG")]
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        assert_eq!(pairs, want);
+        let mut got: Vec<(String, String, Vec<Vec<String>>)> = Vec::new();
+        for (from, row) in &f.paths {
+            for (to, ps) in row {
+                got.push((from.clone(), to.clone(), ps.clone()));
+            }
+        }
+        let want: Vec<(String, String, Vec<Vec<String>>)> = [
+            ("nC", "nG", ["nC", "nF", "nG"]),
+            ("nD", "nG", ["nD", "nF", "nG"]),
+            ("nG", "nC", ["nG", "nF", "nC"]),
+            ("nG", "nD", ["nG", "nF", "nD"]),
+        ]
+        .iter()
+        .map(|(a, b, p)| (a.to_string(), b.to_string(), vec![path(p)]))
+        .collect();
+        assert_eq!(got, want);
+
+        // A star of seven: only G's pairs, through the hub.
+        let mut r = laid_out("tp", 7, Layout::Star);
+        r.driver = Some("nF".into());
+        let f = &solve(&switch_with_two_cables(), &r).unwrap().facts["tp"];
+        assert!(f.paths.iter().all(|(from, row)| {
+            row.iter()
+                .all(|(to, ps)| (from == "nG") != (to == "nG") && ps.len() == 1 && ps[0][1] == "nF")
+        }));
+        assert_eq!(f.paths["nG"].len(), 5);
+    }
+
+    /// Random graphs: the links are exactly the probed pairs between
+    /// members, and the paths exactly the fewest-hop ones, read from the
+    /// tables by brute force.
+    #[test]
+    fn facts_match_brute_force() {
+        let mut rng = Rng(0x5851f42d4c957f2d);
+        let mut checked = 0;
+        for (n, ports, graphs) in [(5, 2, 300), (5, 3, 200), (6, 2, 100)] {
+            for _ in 0..graphs {
+                let t = port_graph(n, ports, &mut rng);
+                for layout in [Layout::Ring, Layout::Line, Layout::Star] {
+                    for k in 3..=n {
+                        let Ok(s) = solve(&t, &laid_out("s", k, layout)) else {
+                            continue;
+                        };
+                        let members: BTreeSet<String> =
+                            s.sets["s"].iter().map(|m| m.node.clone()).collect();
+                        check_facts(&t, &members, &s.facts["s"]);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 500, "{checked}");
+    }
+
+    fn check_facts(t: &Topology, members: &BTreeSet<String>, f: &Facts) {
+        let owner: BTreeMap<&String, &String> = t
+            .ports
+            .iter()
+            .flat_map(|(n, ps)| ps.iter().map(move |p| (&p.addr, n)))
+            .collect();
+        let mut want: BTreeSet<(String, String, String, String)> = BTreeSet::new();
+        for (x, y) in t.links.keys() {
+            if t.forwarded.contains(&(x.clone(), y.clone()))
+                || t.forwarded.contains(&(y.clone(), x.clone()))
+            {
+                continue;
+            }
+            let (Some(a), Some(b)) = (owner.get(x), owner.get(y)) else {
+                continue;
+            };
+            if a == b || !members.contains(*a) || !members.contains(*b) {
+                continue;
+            }
+            want.insert(if a < b {
+                ((*a).clone(), (*b).clone(), x.clone(), y.clone())
+            } else {
+                ((*b).clone(), (*a).clone(), y.clone(), x.clone())
+            });
+        }
+        let got: BTreeSet<(String, String, String, String)> = f
+            .links
+            .iter()
+            .map(|l| {
+                (
+                    l.a.clone(),
+                    l.b.clone(),
+                    l.a_port.addr.clone(),
+                    l.b_port.addr.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(got, want, "links on {:?}", t.links);
+        assert_eq!(got.len(), f.links.len());
+
+        let adj = |a: &String, b: &String| {
+            want.iter()
+                .any(|(x, y, _, _)| (x == a && y == b) || (x == b && y == a))
+        };
+        let all: Vec<String> = members.iter().cloned().collect();
+        for from in &all {
+            for to in &all {
+                if from == to || adj(from, to) {
+                    assert!(f.paths.get(from).and_then(|r| r.get(to)).is_none());
+                    continue;
+                }
+                // Every simple path through members, by brute force.
+                let mut found: Vec<Vec<String>> = Vec::new();
+                fn go(
+                    at: &String,
+                    to: &String,
+                    all: &[String],
+                    adj: &dyn Fn(&String, &String) -> bool,
+                    cur: &mut Vec<String>,
+                    found: &mut Vec<Vec<String>>,
+                ) {
+                    if at == to {
+                        found.push(cur.clone());
+                        return;
+                    }
+                    for m in all {
+                        if !cur.contains(m) && adj(at, m) {
+                            cur.push(m.clone());
+                            go(m, to, all, adj, cur, found);
+                            cur.pop();
+                        }
+                    }
+                }
+                go(from, to, &all, &adj, &mut vec![from.clone()], &mut found);
+                let least = found.iter().map(Vec::len).min();
+                let mut shortest: Vec<Vec<String>> = found
+                    .into_iter()
+                    .filter(|p| Some(p.len()) == least)
+                    .collect();
+                shortest.sort();
+                let got = f
+                    .paths
+                    .get(from)
+                    .and_then(|r| r.get(to))
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(got, shortest, "{from} to {to} on {:?}", t.links);
+            }
+        }
+    }
+
+    /// Every graph on four nodes with each pair absent, cabled or forwarded.
+    /// A forwarded pair is not a link, so it shows in neither `links` nor
+    /// the hops of a path.
+    #[test]
+    fn facts_leave_out_forwarded_pairs() {
+        let n = 4;
+        let m = pairs(n).len() as u32;
+        let mut checked = 0;
+        for code in 0..3u32.pow(m) {
+            let t = graph(n, |k| (code / 3u32.pow(k as u32) % 3) as u8);
+            for layout in [Layout::Ring, Layout::Line, Layout::Star] {
+                for k in 3..=n {
+                    let Ok(s) = solve(&t, &laid_out("s", k, layout)) else {
+                        continue;
+                    };
+                    let members: BTreeSet<String> =
+                        s.sets["s"].iter().map(|m| m.node.clone()).collect();
+                    check_facts(&t, &members, &s.facts["s"]);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "{checked}");
+    }
+
+    /// The basement with its switch island, and with `extra` boxes cabled
+    /// to F's further ports.
+    fn basement(extra: &[&str]) -> Topology {
+        let mut t = switch_with_two_cables();
+        let sw = ["nA", "nB", "nC", "nD", "nE", "nF"];
+        t.islands.push(crate::island::Island {
+            nodes: sw.iter().map(|n| n.to_string()).collect(),
+            addr: sw
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.to_string(), format!("10.100.0.{i}")))
+                .collect(),
+        });
+        for (j, n) in extra.iter().enumerate() {
+            let net = 120 + j;
+            t.ports
+                .get_mut("nF")
+                .unwrap()
+                .push(port(&format!("10.{net}.0.5"), "x", &["rdma"]));
+            t.ports.insert(
+                n.to_string(),
+                vec![port(&format!("10.{net}.0.9"), "x", &["rdma"])],
+            );
+            t.free_gpus.insert(n.to_string(), 1.0);
+            t.links
+                .insert((format!("10.{net}.0.5"), format!("10.{net}.0.9")), 0);
+        }
+        t
+    }
+
+    fn any(k: usize) -> Request {
+        laid_out("s", k, Layout::Any)
+    }
+
+    /// Mesh first, then ring, star and line, then the one-hop fallback.
+    #[test]
+    fn any_takes_the_first_layout_that_fits() {
+        let t = basement(&[]);
+        let s = solve(&t, &any(6)).unwrap();
+        assert_eq!(s.layouts["s"], Layout::Mesh);
+        assert!(!order(&s, "s").contains(&"nG".to_string()));
+
+        // G reaches only F, so seven is no mesh and no ring. F reaches the
+        // other six, so it is a star with F as the hub.
+        let s = solve(&t, &any(7)).unwrap();
+        assert_eq!(s.layouts["s"], Layout::Star);
+        assert_eq!(order(&s, "s")[0], "nF");
+
+        // A driver on C cannot be the hub. A line from G to C puts it on
+        // an end.
+        let mut r = any(7);
+        r.driver = Some("nC".into());
+        let s = solve(&t, &r).unwrap();
+        assert_eq!(s.layouts["s"], Layout::Line);
+        let o = order(&s, "s");
+        assert!(o[0] == "nC" || o[6] == "nC", "{o:?}");
+        assert!(o[0] == "nG" || o[6] == "nG", "{o:?}");
+
+        // H also off F: still a star on F. With the driver on C, no line
+        // holds both G and H, and every box is linked to every other or one
+        // box, F, away.
+        let t = basement(&["nH"]);
+        assert_eq!(solve(&t, &any(8)).unwrap().layouts["s"], Layout::Star);
+        let mut r = any(8);
+        r.driver = Some("nC".into());
+        let s = solve(&t, &r).unwrap();
+        assert_eq!(s.layouts["s"], Layout::Hops);
+        assert_eq!(order(&s, "s").len(), 8);
+        let f = &s.facts["s"];
+        assert_eq!(f.paths["nG"]["nH"], vec![path(&["nG", "nF", "nH"])]);
+        assert_eq!(f.paths["nH"]["nA"], vec![path(&["nH", "nF", "nA"])]);
+        let m = s.sets["s"].iter().find(|m| m.node == "nF").unwrap();
+        assert!(m.prev.is_none() && m.next.is_none() && m.leaves.is_empty());
+        assert_eq!(s.to_json(&t)["layouts"]["s"], "hops");
+
+        let e = solve(&t, &any(9)).unwrap_err();
+        assert!(e.contains("any layout of 9"), "{e}");
+    }
+
+    /// u0 and u1 are each cabled to all four v boxes. Every pair of those
+    /// six is linked or one box apart. No box reaches
+    /// all five others, and no line passes more than five boxes, so the
+    /// six are no star and no line. A seventh, off v0 only, is three links
+    /// from the other v boxes.
+    #[test]
+    fn any_keeps_every_pair_within_one_hop() {
+        let mut t = Topology::default();
+        let mut add = |n: &str| {
+            t.ports.insert(n.into(), Vec::new());
+            t.free_gpus.insert(n.into(), 1.0);
+        };
+        for n in ["u0", "u1", "v0", "v1", "v2", "v3", "w"] {
+            add(n);
+        }
+        let mut cable = |a: &str, b: &str, net: usize| {
+            let (x, y) = (format!("10.{net}.0.1"), format!("10.{net}.0.2"));
+            t.ports.get_mut(a).unwrap().push(port(&x, "p", &["rdma"]));
+            t.ports.get_mut(b).unwrap().push(port(&y, "p", &["rdma"]));
+            t.links.insert((x, y), 0);
+        };
+        let mut net = 0;
+        for u in ["u0", "u1"] {
+            for v in ["v0", "v1", "v2", "v3"] {
+                net += 1;
+                cable(u, v, net);
+            }
+        }
+        cable("v0", "w", 99);
+        t.free_gpus.insert("w".into(), 0.0);
+        let s = solve(&t, &any(6)).unwrap();
+        assert_eq!(s.layouts["s"], Layout::Hops);
+        assert_eq!(order(&s, "s"), ["u0", "u1", "v0", "v1", "v2", "v3"]);
+        assert_eq!(
+            s.facts["s"].paths["v0"]["v1"],
+            vec![path(&["v0", "u0", "v1"]), path(&["v0", "u1", "v1"])]
+        );
+        t.free_gpus.insert("w".into(), 1.0);
+        let e = solve(&t, &any(7)).unwrap_err();
+        assert!(e.contains("through at most 1 others"), "{e}");
+    }
+
+    /// Random graphs: `any` answers with a ring where one exists, else a
+    /// star, else a line, else a set that brute force confirms keeps every
+    /// pair within one hop. It refuses exactly when brute force finds none.
+    #[test]
+    fn any_matches_brute_force() {
+        let mut rng = Rng(0x9e6c63d0676a9a99);
+        for (n, ports, graphs) in [(5, 2, 300), (6, 2, 150), (5, 3, 150)] {
+            for _ in 0..graphs {
+                let t = port_graph(n, ports, &mut rng);
+                for k in 2..=n {
+                    let ring = solve(&t, &laid_out("s", k, Layout::Ring)).is_ok();
+                    let star = solve(&t, &laid_out("s", k, Layout::Star)).is_ok();
+                    let line = solve(&t, &laid_out("s", k, Layout::Line)).is_ok();
+                    let near = |members: &[String]| {
+                        let link = |a: &String, b: &String| {
+                            t.ports[a].iter().any(|x| {
+                                t.ports[b].iter().any(|y| {
+                                    t.links.contains_key(&(x.addr.clone(), y.addr.clone()))
+                                        || t.links.contains_key(&(y.addr.clone(), x.addr.clone()))
+                                })
+                            })
+                        };
+                        members.iter().all(|a| {
+                            members.iter().all(|b| {
+                                a == b
+                                    || link(a, b)
+                                    || members.iter().any(|m| link(a, m) && link(m, b))
+                            })
+                        })
+                    };
+                    let mut sets: Vec<Vec<String>> = vec![Vec::new()];
+                    for i in 0..n {
+                        let more: Vec<Vec<String>> = sets
+                            .iter()
+                            .filter(|s| s.len() < k)
+                            .map(|s| [s.clone(), vec![format!("n{i}")]].concat())
+                            .collect();
+                        sets.extend(more);
+                    }
+                    let hops = sets.iter().any(|s| s.len() == k && near(s));
+                    let at = format!("any of {k} on {:?}", t.links);
+                    match solve(&t, &any(k)) {
+                        Ok(s) => {
+                            let want = if ring {
+                                Layout::Ring
+                            } else if star {
+                                Layout::Star
+                            } else if line {
+                                Layout::Line
+                            } else {
+                                Layout::Hops
+                            };
+                            assert_eq!(s.layouts["s"], want, "{at}");
+                            if want == Layout::Hops {
+                                assert!(near(&order(&s, "s")), "{at}");
+                            }
+                        }
+                        Err(_) => assert!(!ring && !star && !line && !hops, "{at}"),
+                    }
+                    // With a driver, the answer places: a star's hub and a
+                    // line's end are the driver's node whenever it is a
+                    // member. A ring and a hops set do not depend on it.
+                    for d in (0..n).map(|i| format!("n{i}")) {
+                        let mut r = any(k);
+                        r.driver = Some(d.clone());
+                        let Ok(s) = solve(&t, &r) else {
+                            assert!(!ring && !hops, "{at}, driver {d}");
+                            continue;
+                        };
+                        let o = order(&s, "s");
+                        let at_end = o.first() == Some(&d) || o.last() == Some(&d);
+                        match s.layouts["s"] {
+                            Layout::Star => assert!(!o.contains(&d) || o[0] == d, "{at}"),
+                            Layout::Line => assert!(!o.contains(&d) || at_end, "{at}"),
+                            _ => {}
+                        }
+                        if ring {
+                            assert_eq!(s.layouts["s"], Layout::Ring, "{at}, driver {d}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn max_hops_is_one_on_an_any_set() {
+        let shape = |layout: &str, extra: Value| {
+            let mut set = json!({"name": "s", "bundles": 2, "layout": layout});
+            for (k, v) in extra.as_object().unwrap() {
+                set[k] = v.clone();
+            }
+            json!({ "sets": [set] })
+        };
+        assert_eq!(parse(&shape("any", json!({}))).unwrap().sets[0].max_hops, 1);
+        assert_eq!(
+            parse(&shape("any", json!({"max_hops": 1}))).unwrap().sets[0].layout,
+            Layout::Any
+        );
+        assert!(parse(&shape("any", json!({"max_hops": 2})))
+            .unwrap_err()
+            .contains("must be 1"));
+        assert!(parse(&shape("ring", json!({"max_hops": 1})))
+            .unwrap_err()
+            .contains("any layout"));
+        assert!(parse(&shape("any", json!({"ports": "split"}))).is_ok());
+        assert!(Layout::parse("hops").is_err());
     }
 
     /// Two boxes joined by two cables ring over both.
@@ -2646,7 +3541,7 @@ mod tests {
         );
         assert!(parse(&shape("star", "split"))
             .unwrap_err()
-            .contains("ring or a line"));
+            .contains("ports applies to"));
         assert!(parse(&shape("ring", "both")).is_err());
     }
 

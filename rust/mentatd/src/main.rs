@@ -20,6 +20,8 @@ mod meta;
 mod proto;
 mod state;
 mod status;
+#[cfg(test)]
+mod test_alloc;
 mod testnet;
 
 use std::io::BufReader;

@@ -39,7 +39,7 @@ def _claim(gpu_bundles):
     MENTAT_CLAIM_SHAPE is the shape from PROTOCOL.md. Without it the shape is
     one set covering these bundles over a fabric, which is what a
     tensor-parallel group wants and what placement did before claims existed.
-    MENTAT_CLAIM_LAYOUT (`mesh`, `ring`, `line` or `star`) sets that set's
+    MENTAT_CLAIM_LAYOUT (`mesh`, `ring`, `line`, `star` or `any`) sets that set's
     layout, and MENTAT_CLAIM_PORTS (`auto`, `split` or `same`) its ports.
 
     Returns "" when MENTAT_CLAIM is unset, which places exactly as before.

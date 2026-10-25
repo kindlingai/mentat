@@ -685,6 +685,19 @@ def t12c_a_ring_claim_keeps_its_ports_rule():
     assert "one port" in out, out[-1500:]
 
 
+def t12d_an_any_claim_rings_where_no_island_fits():
+    """No island holds four of the ring's boxes, so an any claim takes the
+    ring, and each rank gets the ring's variables."""
+    daemons = state["ring_daemons"]
+    wait_ring_free(daemons)
+    ranks = claimed_ranks(daemons["r3"], "ring-any", "any", 4, (
+        "MENTAT_NODE_IP", "MENTAT_FABRIC_LAYOUT", "MENTAT_FABRIC_NEXT", "MENTAT_FABRIC_RANK"))
+    assert {x["MENTAT_FABRIC_LAYOUT"] for x in ranks} == {"ring"}, ranks
+    assert [x["MENTAT_FABRIC_NEXT"] for x in ranks] == [
+        "10.110.3.2", "10.110.4.2", "10.110.1.2", "10.110.2.2"], ranks
+    assert [x["MENTAT_FABRIC_RANK"] for x in ranks] == ["0", "1", "2", "3"], ranks
+
+
 def main():
     tests = [
         t01_one_seed_reveals_the_whole_mesh,
@@ -703,6 +716,7 @@ def main():
         t12_a_ring_claim_places_in_cable_order,
         t12b_a_star_claim_puts_its_hub_on_the_driver,
         t12c_a_ring_claim_keeps_its_ports_rule,
+        t12d_an_any_claim_rings_where_no_island_fits,
     ]
     try:
         for t in tests:

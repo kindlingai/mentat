@@ -19,6 +19,11 @@ python3 tests/test_topology.py    # two cabled pairs plus a LAN-only box over ME
 cargo test --workspace            # from rust/: framing, WS handshake, status-line grep contract
 ```
 
+The `mentatd` test binary caps the memory it holds at once, 2048 MiB by
+default and `MENTAT_TEST_MEM_CAP` MiB when set. A test that passes the cap
+aborts with "an allocation would pass MENTAT_TEST_MEM_CAP". macOS does not
+enforce `ulimit -v`, so the cap is in the test build's allocator.
+
 Suites run from the repo root, one at a time. They pick free ports and
 collide when run together. Each suite builds what it needs from the `rust/`
 workspace unless `MENTAT_TEST_BINARY` or `MENTAT_SERVE_TEST_BINARY` points

@@ -252,7 +252,8 @@ reserve the GPUs. Two groups may claim one node and compete for its devices.
 | --- | --- |
 | `bundles` | A count of nodes at one GPU each, or a list of GPUs per node |
 | `link` | `rdma` or `ip`. An `rdma` set goes inside one fabric island (see "Placement") |
-| `layout?` | `mesh` (the default), `ring`, `line` or `star` |
+| `layout?` | `mesh` (the default), `ring`, `line`, `star` or `any` |
+| `max_hops?` | For an `any` set, 1, the default. Any other value, and the key on another layout, are refused |
 | `ports?` | For a ring or a line: `auto` (the default), `split` or `same`. Any other layout refuses a value other than `auto` |
 | `vendor` | Pins the set to one GPU vendor. Without it the daemon picks one |
 
@@ -265,6 +266,16 @@ or star link is a probed pair of `link` addresses, with both ends tagged
 through another box. A mesh counts it, and a ring, a line or a star leaves
 it out. A mesh holds every ring and every star, a ring holds every line, and
 two members on one cable are all four.
+
+An `any` set is solved as a mesh, then a ring, a star and a line, and takes
+the first that fits. A star counts only with its hub on the claimant's
+node, and a line only with the claimant's node at one end, where that node
+is a member. Failing those, it takes `hops`: members that each link to
+every other or reach it through at most `max_hops` other members, the first
+such set in node id order. `ports` applies when the answer is a ring or a
+line. The view's `layouts` gives each `any` set's answer: `mesh`, `ring`,
+`star`, `line` or `hops`. A daemon that does not know `any` refuses the claim with
+`bad_shape`.
 
 A star puts its hub on the node of the client that sent the claim when that
 node can be a hub. A daemon that does not know `star` refuses the claim with
@@ -307,6 +318,24 @@ falls back. A daemon that predates `ports` drops the key and solves as
 A ring, a line or a star lists its members in order. A ring starts at its
 lowest node id. A star starts at its hub.
 
+For a ring, line, star or any set, the view also has `links` and `paths`, each
+keyed by set name. They are facts about the set's members and the probes,
+and the caller applies its own policy to them. Both stay the same whatever
+the layout's order, `ports`, the driver's node or a rotation.
+
+| Field | Value |
+| --- | --- |
+| `links` | Every probed, non-forwarded link between two members that meets the set's `link`, once each. `a` and `b` are the ends, `a` on the lower node id, each with `node`, `host`, `addr`, `iface` and `port`. `rtt_ms` is the probe's round trip. Sorted by node ids, then addresses |
+| `paths` | For each ordered pair of members with no link between them, every fewest-hop path through the set's own members, as node ids from the first member to the last: `paths[set][from][to]`. Sorted, at most 64 per pair |
+
+A link's `port` is its end's port group, named by the lowest address in it.
+Two addresses of one node are in one group when they reach the same far
+addresses, so one physical port usually shows as one group. A Spark port
+with a subnet per PCI root shows as two. A path never passes through a node
+outside the set, since no rank there could relay. In a switchless ring of
+four, each member's opposite has two paths, one each way round. On a switch,
+members reach each other directly and have no paths.
+
 A claim on a name held for a different shape is refused. Re-solving would
 move nodes under the first claimant. Only the head solves a claim. A claim
 sent to any other daemon is refused with the head's address. Two daemons
@@ -325,6 +354,9 @@ reaches the new head, which solves the shape again.
 `pg_create` with `claim` set places among the nodes the claim chose. A
 placement group that requests more than its claim holds stays pending.
 Placing outside the claim would split ranks that agreed on one view.
+
+A claim of one `any` set places as its answer: a ring, star or line as
+below, and a mesh or hops answer among its members in no order.
 
 A claim of one `ring`, `line` or `star` set places bundle `i` on member
 `i`, and needs one bundle per member. vLLM puts rank 0 on the driver's node.
