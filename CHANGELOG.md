@@ -2,7 +2,7 @@
 
 The protocol stays at 0.99 in every release below.
 
-## Unreleased
+## 0.25.0 (2026-10-25)
 
 ### Added
 
