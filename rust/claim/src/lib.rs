@@ -10,6 +10,7 @@
 //! topology get the same view.
 
 pub mod island;
+mod rank;
 pub mod shape;
 mod solve;
 pub mod topology;
@@ -19,6 +20,7 @@ pub mod view;
 mod test_alloc;
 
 pub use island::Island;
+pub use rank::{ranks, Ranks};
 pub use shape::{Between, Driver, Layout, Link, Ports, Set, Shape};
 pub use topology::{islands, Node, Port, Probe, Topology};
 pub use view::View;
@@ -33,6 +35,8 @@ pub enum Error {
     BadShape(String),
     /// No placement on the topology meets the shape.
     Unsolvable(String),
+    /// No rank order of a line or a star puts rank 0 on the driver's node.
+    Driver(String),
 }
 
 impl Error {
@@ -41,12 +45,13 @@ impl Error {
         match self {
             Error::BadShape(_) => "bad_shape",
             Error::Unsolvable(_) => "unsolvable_claim",
+            Error::Driver(_) => "driver_position",
         }
     }
 
     pub fn message(&self) -> &str {
         match self {
-            Error::BadShape(m) | Error::Unsolvable(m) => m,
+            Error::BadShape(m) | Error::Unsolvable(m) | Error::Driver(m) => m,
         }
     }
 }
@@ -65,8 +70,8 @@ impl std::error::Error for Error {}
 /// requires. With the shape's default `driver: first`, a star puts its hub
 /// there when it can, and an `any` set passes over a star with the node on a
 /// leaf and a line with the node inside it. A ring and a line keep their
-/// solved order, and the caller rotates a ring or reverses a line to start
-/// at the node. With `driver: ignore`, `driver` has no effect.
+/// solved order, and `ranks` turns them to start at the node. With
+/// `driver: ignore`, `driver` has no effect.
 pub fn solve(topology: &Topology, shape: &Shape, driver: Option<&str>) -> Result<View, Error> {
     shape.check()?;
     let g = solve::Graph::new(topology);

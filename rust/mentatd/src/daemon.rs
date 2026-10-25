@@ -2389,77 +2389,31 @@ fn ignores_driver(st: &State, group: &str, claim: &str) -> bool {
 
 /// The rank order for a claim of one ring, line or star set, as this
 /// driver needs it. None for any other claim.
-///
-/// vLLM expects rank 0 on the driver's node. A ring is rotated to put it
-/// there. A line is reversed when the driver is on its far end, and refused
-/// when the driver is inside it, since no order then has rank 0 on the
-/// driver's node. A star is refused when the driver is on a leaf, since its
-/// hub is rank 0.
 fn claim_order(
     st: &State,
     group: &str,
     claim: &str,
     driver_node: &str,
 ) -> Option<Result<RankOrder, String>> {
-    use crate::claim::Layout;
     let c = st.claims.get(&(group.to_string(), claim.to_string()))?;
     let shape = crate::claim::Shape::from_json(&c.shape).ok()?;
     let [set] = shape.sets.as_slice() else {
         return None;
     };
-    // An `any` set places as what it resolved to. A mesh or hops answer has
-    // no order.
-    let layout = match set.layout {
-        Layout::Any => Layout::parse(c.view["layouts"][&set.name].as_str()?).ok()?,
-        l => l,
+    let view: mentat_claim::View = serde_json::from_value(c.view.clone()).ok()?;
+    let ranks = match mentat_claim::ranks(&shape, &view, &set.name, Some(driver_node)) {
+        Ok(r) => r?,
+        Err(e @ mentat_claim::Error::Driver(_)) => {
+            return Some(Err(format!("claim {claim:?}: {e}")))
+        }
+        Err(_) => return None,
     };
-    if !layout.ordered() {
-        return None;
-    }
-    let mut order: Vec<(String, Value)> = c.view["sets"][&set.name]
-        .as_array()?
+    let size = ranks.members.len();
+    Some(Ok(ranks
+        .members
         .iter()
-        .map(|m| {
-            (
-                m["node"].as_str().unwrap_or_default().to_string(),
-                m.clone(),
-            )
-        })
-        .collect();
-    let last = order.len().saturating_sub(1);
-    match (layout, order.iter().position(|(n, ..)| n == driver_node)) {
-        (Layout::Ring, Some(i)) => order.rotate_left(i),
-        (Layout::Line, Some(i)) if i == last && i > 0 => {
-            order.reverse();
-            for (_, m) in &mut order {
-                let (prev, next) = (m["prev"].take(), m["next"].take());
-                m["prev"] = next;
-                m["next"] = prev;
-            }
-        }
-        (Layout::Line, Some(i)) if i > 0 => {
-            return Some(Err(format!(
-                "claim {claim:?} is a line and the driver's node is inside it. Start \
-                 the driver on a node at one end of the line"
-            )))
-        }
-        (Layout::Star, Some(i)) if i > 0 => {
-            let hub = c.view["sets"][&set.name][0]["host"]
-                .as_str()
-                .unwrap_or(&order[0].0)
-                .to_string();
-            return Some(Err(format!(
-                "claim {claim:?} is a star with its hub on {hub}, and the driver's node \
-                 is a leaf. Start the driver on {hub}"
-            )));
-        }
-        _ => {}
-    }
-    let size = order.len();
-    Some(Ok(order
-        .into_iter()
         .enumerate()
-        .map(|(i, (n, m))| (n, rank_env(layout, &m, i, size)))
+        .map(|(i, m)| (m.node.clone(), rank_env(ranks.layout, m, i, size)))
         .collect()))
 }
 
@@ -2468,7 +2422,7 @@ fn claim_order(
 /// reaches it.
 fn rank_env(
     layout: crate::claim::Layout,
-    member: &Value,
+    member: &mentat_claim::view::Member,
     rank: usize,
     size: usize,
 ) -> BTreeMap<String, String> {
@@ -2480,26 +2434,24 @@ fn rank_env(
     env.insert("MENTAT_FABRIC_RANK".to_string(), rank.to_string());
     env.insert("MENTAT_FABRIC_SIZE".to_string(), size.to_string());
     let mut ifaces: Vec<&str> = Vec::new();
-    for (key, p) in [("PREV", "prev"), ("NEXT", "next"), ("HUB", "hub")] {
-        let p = &member[p];
-        if let Some(addr) = p["addr"].as_str() {
-            env.insert(format!("MENTAT_FABRIC_{key}"), addr.to_string());
-        }
-        if let Some(iface) = p["iface"].as_str() {
-            env.insert(format!("MENTAT_FABRIC_{key}_IFACE"), iface.to_string());
-            if !ifaces.contains(&iface) {
+    for (key, p) in [
+        ("PREV", &member.prev),
+        ("NEXT", &member.next),
+        ("HUB", &member.hub),
+    ] {
+        let Some(p) = p else { continue };
+        env.insert(format!("MENTAT_FABRIC_{key}"), p.addr.clone());
+        if let Some(iface) = &p.iface {
+            env.insert(format!("MENTAT_FABRIC_{key}_IFACE"), iface.clone());
+            if !ifaces.contains(&iface.as_str()) {
                 ifaces.push(iface);
             }
         }
     }
-    let leaves = member["leaves"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    if !leaves.is_empty() {
-        let addrs: Vec<&str> = leaves.iter().filter_map(|p| p["addr"].as_str()).collect();
+    if !member.leaves.is_empty() {
+        let addrs: Vec<&str> = member.leaves.iter().map(|p| p.addr.as_str()).collect();
         env.insert("MENTAT_FABRIC_LEAVES".to_string(), addrs.join(","));
-        for iface in leaves.iter().filter_map(|p| p["iface"].as_str()) {
+        for iface in member.leaves.iter().filter_map(|p| p.iface.as_deref()) {
             if !ifaces.contains(&iface) {
                 ifaces.push(iface);
             }

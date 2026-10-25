@@ -1,4 +1,5 @@
-//! A solved claim, the `view` of a `claim` reply.
+//! A solved claim, the `view` of a `claim` reply. A field missing from a
+//! view being read takes its default.
 
 use std::collections::BTreeMap;
 
@@ -9,6 +10,7 @@ use crate::NodeId;
 
 /// Where each set landed, and the links the answer rests on.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct View {
     /// Each set's members. A ring, a line or a star lists them in rank order.
     pub sets: BTreeMap<String, Vec<Member>>,
@@ -31,6 +33,7 @@ pub type Paths = BTreeMap<NodeId, BTreeMap<NodeId, Vec<Vec<NodeId>>>>;
 
 /// One member of a set.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Member {
     pub node: NodeId,
     pub host: String,
@@ -40,21 +43,22 @@ pub struct Member {
     pub iface: Option<String>,
     pub tags: Vec<String>,
     /// In a ring or a line, the link to the member before this one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prev: Option<Neighbor>,
     /// In a ring or a line, the link to the member after this one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<Neighbor>,
     /// In a star, a leaf's link to the hub.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hub: Option<Neighbor>,
     /// In a star, the hub's link to each leaf, in member order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub leaves: Vec<Neighbor>,
 }
 
 /// A link from a member to another member.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Neighbor {
     pub node: NodeId,
     pub host: String,
@@ -68,6 +72,7 @@ pub struct Neighbor {
 
 /// The link that meets one `between` entry.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BetweenLink {
     pub from: BetweenEnd,
     pub to: BetweenEnd,
@@ -76,6 +81,7 @@ pub struct BetweenLink {
 
 /// One end of a `between` link.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BetweenEnd {
     /// The set holding this end's node.
     pub set: String,
@@ -87,6 +93,7 @@ pub struct BetweenEnd {
 
 /// One link between two members, with `a` the lower node id.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LinkFact {
     pub a: LinkEnd,
     pub b: LinkEnd,
@@ -95,6 +102,7 @@ pub struct LinkFact {
 
 /// One end of a link between two members.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LinkEnd {
     pub node: NodeId,
     pub host: String,

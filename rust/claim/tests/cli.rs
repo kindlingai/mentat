@@ -95,3 +95,39 @@ fn a_failure_prints_its_code() {
         assert!(v["error"].as_str().is_some_and(|e| !e.is_empty()), "{v}");
     }
 }
+
+/// `ranks` turns a solved ring to start at the driver, and refuses a line
+/// with the driver inside it.
+#[test]
+fn ranks_starts_at_the_driver() {
+    let view = |nodes: &[&str]| json!({"sets": {"s": nodes.iter().map(|n| json!({"node": n})).collect::<Vec<_>>()}});
+    let req = |layout: &str, driver: &str| {
+        json!({
+            "shape": {"sets": [{"name": "s", "bundles": 3, "layout": layout}]},
+            "view": view(&["a", "b", "c"]),
+            "set": "s",
+            "driver": driver,
+        })
+        .to_string()
+    };
+    let (code, v) = run("ranks", &req("ring", "b"));
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["layout"], "ring");
+    let order: Vec<&str> = v["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["node"].as_str().unwrap())
+        .collect();
+    assert_eq!(order, ["b", "c", "a"]);
+
+    let (code, v) = run("ranks", &req("line", "b"));
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (1, Some("driver_position")),
+        "{v}"
+    );
+
+    let (code, v) = run("ranks", &req("mesh", "b"));
+    assert_eq!((code, v), (0, Value::Null));
+}

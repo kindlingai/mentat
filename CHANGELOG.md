@@ -10,6 +10,8 @@ The protocol stays at 0.99 in every release below.
   `Topology` and `View` structs and a `mentat-claim` binary that reads a
   shape and a topology as JSON. mentatd solves claims with it. The
   artifacts image, the release tarballs and crates.io carry it.
+- `mentat_claim::ranks` and `mentat-claim ranks` put a ring, line or star
+  set in rank order for a driver, the order mentatd places in.
 
 ### Fixed
 

@@ -86,7 +86,20 @@ under `claim`.
 ## Rank order
 
 With the default `"driver": "first"`, `driver` names the node that will hold
-rank 0, as vLLM requires. A star puts its hub there when it can. The view
-lists a ring or a line in its solved order. To start one at the driver,
-rotate the ring, or reverse the line and swap each member's `prev` and
-`next`. With `"driver": "ignore"`, `driver` has no effect.
+rank 0, as vLLM requires. A star puts its hub there when it can. Every
+holder of a claim shares one view, so the view lists a ring or a line in its
+solved order.
+
+`ranks(&shape, &view, set, driver)` returns a ring, line or star set in rank
+order for one driver. A ring turns to start at the driver's node, and a line
+reverses when the driver's node is its last member. A line with the driver's
+node inside it, or a star with the driver's node on a leaf, returns
+`Error::Driver`. A mesh or a hops answer has no order and returns None.
+With `"driver": "ignore"`, the solved order stays.
+
+```bash
+mentat-claim ranks < ranks.json
+```
+
+The request holds `shape`, `view`, `set` and an optional `driver`. The
+command prints `{"layout", "members"}`, or null for a set with no order.
