@@ -238,8 +238,11 @@ reservation. Every holder gets the view the first claim produced, so ranks
 that start independently agree without a coordinator.
 
 A name belongs to the claiming client's group. Two groups that pick one name
-hold two claims. A claim chooses nodes, and the placement groups inside it
-reserve the GPUs. Two groups may claim one node and compete for its devices.
+hold two claims. A claim chooses among the nodes where the claiming client's
+group has a live agent, since placement puts a group only on its own agents.
+A claim chooses nodes, and the placement groups inside it reserve the GPUs.
+Two groups with agents on one node may both claim it and compete for its
+devices.
 
 ```json
 {"t": "claim", "name": "myjob", "shape": {
@@ -317,6 +320,7 @@ falls back. A daemon that predates `ports` drops the key and solves as
 | Field | Value |
 | --- | --- |
 | `bind` | The address the rank binds. In a ring or a line, the port toward `next`, or toward `prev` at a line's end. In a star, a leaf's port toward `hub`, and the hub's port toward its first leaf |
+| `host` | The node's hostname from its daemon, or its address for a node with an agent and no daemon |
 | `iface` | Null for an address from `MENTAT_ANNOUNCE_ADDRS` |
 | `prev?`, `next?` | In a ring or a line, the member before and after this one: `node`, `host`, `addr` (the far end of the cable), and `bind` and `iface` (this end) |
 | `hub?` | In a star, a leaf's link to the hub, in the form of `next` |
@@ -349,11 +353,13 @@ move nodes under the first claimant. Only the head solves a claim. A claim
 sent to any other daemon is refused with the head's address. Two daemons
 solving one name against their own views could each hand out a placement.
 
-Each session that sends `claim` joins the holder set. A claim ends when its
-last holder's session is reaped, or when the head changes. The reap grace
-applies, so a claim outlives its driver by `MENTAT_SESSION_REAP_GRACE_MS`. A
-driver that restarts inside that window under the same name gets the view
-it had.
+Each client that sends `claim` joins the holder set. A claim ends when its
+last holder lets go, or when the head changes. A session lets go when it is
+reaped. A client with no session lets go when its last open link closes, so
+a client that only reads the view holds it by keeping one link open. A
+session's reap grace applies, so a claim outlives its driver by
+`MENTAT_SESSION_REAP_GRACE_MS`. A driver that restarts inside that window
+under the same name gets the view it had.
 
 A head change ends every claim. With `MENTAT_CLAIM` set, the shim sends
 `claim` before each `pg_create`. After a head change, the next `claim`

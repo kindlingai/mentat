@@ -981,6 +981,9 @@ fn client_conn(
         // A driver's worker threads share its session's row, which leaves
         // with the session. A CLI connection's row leaves with it.
         let mut st = shared.st.lock().unwrap();
+        if !moved && holds_end_with_link(&st, &client_id) {
+            release_all(&mut st, &client_id);
+        }
         if st
             .clients
             .get(&client_id)
@@ -1420,7 +1423,14 @@ fn claim(
     }
     let mut req = crate::claim::parse(shape).map_err(|e| Msg::refused("bad_shape", e))?;
     req.driver = st.clients.get(client_id).map(|c| c.node_id.clone());
-    let topo = crate::claim::topology(st);
+    let mut topo = crate::claim::topology(st);
+    // Placement puts a group only on its own agents, so a claim solves over
+    // their nodes.
+    topo.free_gpus.retain(|n, _| {
+        st.agents
+            .values()
+            .any(|a| a.alive && a.group == group && a.node_id == *n)
+    });
     let solution =
         crate::claim::solve(&topo, &req).map_err(|e| Msg::refused("unsolvable_claim", e))?;
     st.claim_generation += 1;
@@ -1470,6 +1480,16 @@ fn release(st: &mut State, client_id: &str, key: &(String, String)) {
             "",
         );
     }
+}
+
+/// Whether a client's claims end now that one of its links closed: it holds
+/// no session, none is waiting out the reap grace, and no other link of its
+/// is open. A driver's worker threads share its session's id, so their links
+/// leave its claims to the session.
+fn holds_end_with_link(st: &State, client_id: &str) -> bool {
+    !st.client_links.iter().any(|(id, _)| id == client_id)
+        && !st.reap_pending.contains_key(client_id)
+        && !st.clients.get(client_id).is_some_and(|c| c.has_session)
 }
 
 /// Drop every claim this client held. This runs where its other resources
@@ -3198,6 +3218,97 @@ mod tests {
         // A different request under the same name is still refused.
         let wider = serde_json::json!({"sets": [{"name": "s", "bundles": [2]}]});
         assert!(claim(&mut st, "c4", "grp", "fence", &wider).is_err());
+    }
+
+    /// The head's own box and one peer, `nP` on 10.0.0.2, whose status
+    /// names it `peer-box`. Each has an agent with one GPU: the head's in
+    /// group `other` and the peer's in `g`.
+    fn head_and_peer() -> State {
+        let mut st = State::new("10.0.0.1".into(), "head-box".into(), "10.0.0.1:6379".into());
+        st.head_node_id = st.node_id.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        st.peers.insert(
+            "nP".into(),
+            crate::state::PeerInfo {
+                node_id: "nP".into(),
+                outbound: true,
+                node_ip: "10.0.0.2".into(),
+                link_ip: "10.0.0.2".into(),
+                addrs: vec!["10.0.0.2".into()],
+                addr_tags: Default::default(),
+                addr_ifaces: Default::default(),
+                addr_macs: Default::default(),
+                probe_pairs: Default::default(),
+                ambiguous_ports: Default::default(),
+                control_port: 6379,
+                http_port: 6380,
+                writer: crate::state::FrameWriter::new(stream),
+                alive: true,
+                last_seen_ms: crate::state::now_ms_u64(),
+                dead_since_ms: None,
+                stale: false,
+                last_status: json!({"hostname": "peer-box"}),
+            },
+        );
+        let mut st = with_agent(with_agent(st, "ag-head"), "ag-peer");
+        st.agents.get_mut("ag-head").unwrap().group = "other".into();
+        let peer = st.agents.get_mut("ag-peer").unwrap();
+        peer.node_id = "nP".into();
+        peer.node_ip = "10.0.0.2".into();
+        st
+    }
+
+    /// Placement puts a group only on its own agents. A claim that took the
+    /// head's free GPU from group `other` would never place.
+    #[test]
+    fn a_claim_solves_over_its_own_group() {
+        let mut st = head_and_peer();
+        let shape = json!({"sets": [{"name": "s", "bundles": 1}]});
+        let (_, view) = claim(&mut st, "c1", "g", "one", &shape).unwrap();
+        assert_eq!(view["sets"]["s"][0]["node"], "nP");
+        let (_, view) = claim(&mut st, "c2", "other", "one", &shape).unwrap();
+        assert_eq!(view["sets"]["s"][0]["node"], st.node_id.as_str());
+        let two = json!({"sets": [{"name": "s", "bundles": 2}]});
+        assert!(claim(&mut st, "c3", "g", "two", &two).is_err());
+    }
+
+    /// A view names every member by its hostname, the head's own box and a
+    /// peer alike. A peer was named by its address.
+    #[test]
+    fn a_claim_names_a_peer_by_its_hostname() {
+        let mut st = head_and_peer();
+        let shape = json!({"sets": [{"name": "s", "bundles": 1}]});
+        let (_, view) = claim(&mut st, "c1", "g", "one", &shape).unwrap();
+        assert_eq!(view["sets"]["s"][0]["host"], "peer-box");
+        let (_, view) = claim(&mut st, "c2", "other", "one", &shape).unwrap();
+        assert_eq!(view["sets"]["s"][0]["host"], "head-box");
+    }
+
+    /// A client with no session holds its claims while any of its links is
+    /// open. A session's id, live or inside its reap grace, keeps them.
+    #[test]
+    fn a_sessionless_client_holds_while_a_link_is_open() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let link = || {
+            crate::state::FrameWriter::new(
+                std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap(),
+            )
+        };
+        let mut st = State::new("10.0.0.1".into(), "box".into(), "10.0.0.1:6379".into());
+        st.client_links.push(("other".into(), link()));
+        assert!(super::holds_end_with_link(&st, "cli"));
+        st.client_links.push(("cli".into(), link()));
+        assert!(!super::holds_end_with_link(&st, "cli"));
+        st.client_links.clear();
+
+        let mut st = with_driver(st, "drv");
+        assert!(!super::holds_end_with_link(&st, "drv"));
+        st.clients.remove("drv");
+        st.reap_pending.insert("drv".into(), 1);
+        assert!(!super::holds_end_with_link(&st, "drv"));
+        st.reap_pending.clear();
+        assert!(super::holds_end_with_link(&st, "drv"));
     }
 
     fn state_with(owner: &str, at_ms: u64) -> State {

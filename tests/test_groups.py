@@ -203,6 +203,28 @@ else:
     assert inside is not None and len(inside) == 1, inside
 
 
+def t05b_a_sessionless_claim_ends_with_its_link():
+    """A client with no session, such as a launcher that only reads the
+    view, holds its claim while its link is open. Its claim stayed until the
+    head changed, so a later boot under the name got the old view."""
+    from ray import _client
+
+    def claims():
+        g = cluster.status_json("claimed")["groups"].get("claimed", {})
+        return g.get("claims", {})
+
+    shape = {"sets": [{"name": "solo", "bundles": 1, "link": "ip"}]}
+    conn = _client.Connection(cluster.address, "cli-claim", "claimed", kind="cli")
+    resp, _ = conn.request({"t": "claim", "name": "cli-test", "shape": shape}, expect="claim_ok")
+    assert resp["view"]["sets"]["solo"], resp
+    assert "cli-test" in claims(), claims()
+    conn.close()
+    deadline = time.monotonic() + 10
+    while "cli-test" in claims():
+        assert time.monotonic() < deadline, f"the claim outlived its link: {claims()}"
+        time.sleep(0.1)
+
+
 def t06_a_new_driver_places_once_the_old_actors_exit():
     """The reap sent the kill and ran placement while the old actors were
     still running, so the new driver's group pended behind GPUs that came
@@ -355,6 +377,7 @@ def main():
         t03_parallel_groups_share_nodes,
         t04_metrics_per_group,
         t05_a_claim_fences_placement,
+        t05b_a_sessionless_claim_ends_with_its_link,
         t06_a_new_driver_places_once_the_old_actors_exit,
         t07_the_grace_runs_from_the_latest_disconnect,
     ]

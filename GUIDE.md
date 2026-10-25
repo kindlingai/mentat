@@ -472,7 +472,8 @@ resolved first.
 
 A claim reserves a set of nodes under a name and returns the same view to
 every holder of that name. Ranks that start independently agree without a
-coordinator. A claim ends when its last holder disconnects.
+coordinator. A claim chooses among the nodes where the group has a live
+agent. A claim ends when its last holder disconnects.
 
 The shim reads `MENTAT_CLAIM` and `MENTAT_CLAIM_SHAPE` at
 `ray.util.placement_group`, because Ray's API cannot express a shape. With

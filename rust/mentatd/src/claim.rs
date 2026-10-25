@@ -1689,7 +1689,10 @@ pub fn topology(st: &crate::state::State) -> Topology {
     for p in st.peers.values().filter(|p| p.alive) {
         record(
             &p.node_id,
-            &p.node_ip,
+            p.last_status["hostname"]
+                .as_str()
+                .filter(|h| !h.is_empty())
+                .unwrap_or(&p.node_ip),
             &p.addrs,
             &p.addr_tags,
             &p.addr_ifaces,

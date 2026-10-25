@@ -2,6 +2,22 @@
 
 The protocol stays at 0.99 in every release below.
 
+## Unreleased
+
+### Changed
+
+- A claim solves over the nodes where the claiming client's group has a
+  live agent. It used to solve over every live agent, and could choose a
+  node where the group had no agent, which placement could never use.
+- A client with no session holds its claims while any of its links is
+  open, and lets go when the last one closes. Its claims used to stay until
+  the head changed, so a later claim under the name got the old view.
+
+### Fixed
+
+- A claim view's `host` is each node's hostname. For every node but the
+  head's own, it used to be the node's address.
+
 ## 0.23.0 (2026-10-25)
 
 ### Added
