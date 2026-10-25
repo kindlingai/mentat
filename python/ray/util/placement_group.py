@@ -29,7 +29,7 @@ class PlacementGroup:
 
 
 def _claim(gpu_bundles):
-    """Claim the placement named by MENTAT_CLAIM, returning its name.
+    """Claim the placement named by MENTAT_CLAIM, returning its name and shape.
 
     ray.placement_group takes bundles and a strategy, and neither can say "a
     cabled pair here and a cabled pair there". The shape comes from the
@@ -42,11 +42,12 @@ def _claim(gpu_bundles):
     MENTAT_CLAIM_LAYOUT (`mesh`, `ring`, `line`, `star` or `any`) sets that set's
     layout, and MENTAT_CLAIM_PORTS (`auto`, `split` or `same`) its ports.
 
-    Returns "" when MENTAT_CLAIM is unset, which places exactly as before.
+    Returns ("", None) when MENTAT_CLAIM is unset, which places exactly as
+    before.
     """
     name = os.environ.get("MENTAT_CLAIM", "").strip()
     if not name:
-        return ""
+        return "", None
     raw = os.environ.get("MENTAT_CLAIM_SHAPE", "").strip()
     if raw:
         try:
@@ -64,7 +65,42 @@ def _claim(gpu_bundles):
     _client.get_conn().request(
         {"t": "claim", "name": name, "shape": shape}, expect="claim_ok"
     )
-    return name
+    return name, shape
+
+
+# Whether this process set VLLM_RAY_BUNDLE_INDICES, so a later placement
+# group may replace or drop it. A value the user set stays.
+_SET_INDICES = False
+
+
+def _pin_ranks(bundles, shape):
+    """Make vLLM's rank i the bundle at index i, as the claim placed it.
+
+    Unset, vLLM's RayExecutorV2 puts the driver's node first and sorts the
+    rest by node id, which here is IP order, not the claim's order. The
+    executor reads the variable after this placement group exists.
+
+    vLLM takes every listed bundle as a rank and checks the count against the
+    world size, so a group with a bundle that has no GPU keeps vLLM's order.
+    So does a shape with `"driver": "ignore"`. Its rank 0 may sit off the
+    driver's node, and vLLM's broadcast queue fails to start with the
+    driver's ranks anywhere but first. vLLM's own sort puts them first.
+
+    `shape` of None, for an unclaimed group, drops a pin this process set.
+    """
+    global _SET_INDICES
+    if "VLLM_RAY_BUNDLE_INDICES" in os.environ and not _SET_INDICES:
+        return
+    pin = (
+        shape is not None
+        and shape.get("driver", "first") != "ignore"
+        and all(float(b.get("GPU", 0)) > 0 for b in bundles)
+    )
+    if pin:
+        os.environ["VLLM_RAY_BUNDLE_INDICES"] = ",".join(str(i) for i in range(len(bundles)))
+    else:
+        os.environ.pop("VLLM_RAY_BUNDLE_INDICES", None)
+    _SET_INDICES = pin
 
 
 def placement_group(bundles, strategy="PACK", name="", lifetime=None):
@@ -72,9 +108,10 @@ def placement_group(bundles, strategy="PACK", name="", lifetime=None):
     # GPU was always rounded up to one on the daemon side.
     gpu_bundles = [max(1, int(-(-float(b.get("GPU", 0)) // 1))) for b in bundles]
     req = {"t": "pg_create", "bundles": gpu_bundles, "strategy": strategy}
-    claimed = _claim(gpu_bundles)
+    claimed, shape = _claim(gpu_bundles)
     if claimed:
         req["claim"] = claimed
+    _pin_ranks(bundles, shape)
     resp, _ = _client.get_conn().request(req, expect="pg_create_ok")
     return PlacementGroup(resp["pg_id"], bundles)
 

@@ -74,7 +74,7 @@ property guards against. The others shipped.
 The model covers one group on the head. It leaves out the mesh, election,
 the event stream and byte-level formats. A device stands for a node, so a
 claim is a set of devices. The model keeps only the first member of a
-claim's order. The exhaustive test in `claim.rs` covers which ring or line
+claim's order, and only claims with `driver: first`. The exhaustive test in `claim.rs` covers which ring or line
 the solver picks. It checks every graph on up to five nodes against brute
 force.
 

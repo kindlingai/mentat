@@ -90,16 +90,49 @@ def t01_initialize_ray_cluster():
         assert table["bundles"][i]["GPU"] == 1.0
         assert isinstance(table["bundles_to_node_id"][i], str)
     assert len(pg.bundle_specs) == WORLD_SIZE  # ray_utils.py:436/465/615
+    # An unclaimed group keeps vLLM's own rank order.
+    assert "VLLM_RAY_BUNDLE_INDICES" not in os.environ
+
+
+def t01b_the_rank_pin():
+    # Called directly: the pin is env-only and this process holds no claim.
+    import importlib
+
+    # ray.util re-exports placement_group the function under the module's name.
+    pgmod = importlib.import_module("ray.util.placement_group")
+
+    one = [{"GPU": 1.0}] * 3
+    ring = {"sets": [{"name": "all", "bundles": [1, 1, 1], "layout": "ring"}]}
+    pgmod._pin_ranks(one, ring)
+    assert os.environ["VLLM_RAY_BUNDLE_INDICES"] == "0,1,2"
+    # A later claim replaces the shim's own value, and an unclaimed group
+    # or an ignored driver drops it.
+    pgmod._pin_ranks(one[:2], ring)
+    assert os.environ["VLLM_RAY_BUNDLE_INDICES"] == "0,1"
+    pgmod._pin_ranks(one, None)
+    assert "VLLM_RAY_BUNDLE_INDICES" not in os.environ
+    pgmod._pin_ranks(one, {**ring, "driver": "ignore"})
+    assert "VLLM_RAY_BUNDLE_INDICES" not in os.environ
+    pgmod._pin_ranks(one + [{"CPU": 1.0}], ring)
+    assert "VLLM_RAY_BUNDLE_INDICES" not in os.environ
+    # The user's value stays.
+    os.environ["VLLM_RAY_BUNDLE_INDICES"] = "2,0,1"
+    pgmod._pin_ranks(one, ring)
+    pgmod._pin_ranks(one, None)
+    assert os.environ["VLLM_RAY_BUNDLE_INDICES"] == "2,0,1"
+    del os.environ["VLLM_RAY_BUNDLE_INDICES"]
 
 
 def t02_create_workers():
     # ray_executor_v2.py:378-395, kwargs verbatim
     from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+    from fake_worker import vllm_rank_bundles
+
     pg = state["pg"]
     instance_id = "1787840107855336818"
     workers = []
-    for rank in range(WORLD_SIZE):
+    for rank, bundle in enumerate(vllm_rank_bundles(pg)):
         actor = (
             ray.remote(VllmShapeWorker)
             .options(
@@ -108,7 +141,7 @@ def t02_create_workers():
                 num_gpus=1.0,
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
-                    placement_group_bundle_index=rank,
+                    placement_group_bundle_index=bundle,
                 ),
                 runtime_env={
                     "env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
@@ -178,6 +211,7 @@ def main():
     tests = [
         t00_unimplemented_surface_probes_cleanly,
         t01_initialize_ray_cluster,
+        t01b_the_rank_pin,
         t02_create_workers,
         t03_monitor_loop_and_shutdown,
     ]

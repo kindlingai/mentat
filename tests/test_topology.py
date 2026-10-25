@@ -560,14 +560,14 @@ sys.path[:0] = os.environ["PYTHONPATH"].split(os.pathsep)
 import ray
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy as PGS
-from fake_worker import FakeWorker
+from fake_worker import FakeWorker, vllm_rank_bundles
 ray.init()
 pg = placement_group([{{"GPU": 1.0}}] * {n})
 assert ray.wait([pg.ready()], timeout=60)[0], "the claim never placed"
 ws = [ray.remote(FakeWorker).options(
           num_gpus=1, scheduling_strategy=PGS(placement_group=pg,
-                                              placement_group_bundle_index=i)).remote(rank=i)
-      for i in range({n})]
+                                              placement_group_bundle_index=b)).remote(rank=r)
+      for r, b in enumerate(vllm_rank_bundles(pg))]
 envs = ray.get([w.env_dump.remote() for w in ws], timeout=60)
 print(json.dumps([{{k: e.get(k, "") for k in {list(keys)!r}}} for e in envs]), flush=True)
 """

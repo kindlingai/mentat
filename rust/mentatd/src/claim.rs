@@ -103,6 +103,27 @@ impl Ports {
     }
 }
 
+/// Whether the driver's node shapes the answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Driver {
+    /// Rank 0 on the driver's node when it is a member, as vLLM requires.
+    First,
+    /// The answer and its order leave the driver out.
+    Ignore,
+}
+
+impl Driver {
+    pub fn parse(s: &str) -> Result<Driver, String> {
+        match s {
+            "first" | "" => Ok(Driver::First),
+            "ignore" => Ok(Driver::Ignore),
+            other => Err(format!(
+                "unknown driver {other:?}, expected first or ignore"
+            )),
+        }
+    }
+}
+
 impl Link {
     pub fn parse(s: &str) -> Result<Link, String> {
         match s {
@@ -179,6 +200,8 @@ pub struct Request {
     /// The node of the client that sent the claim. A star puts its hub
     /// there when it can, since vLLM puts rank 0 on the driver's node.
     pub driver: Option<NodeId>,
+    /// With `Ignore`, the solve leaves `driver` out.
+    pub driver_rule: Driver,
 }
 
 /// One address a node listens on.
@@ -1410,7 +1433,11 @@ fn search(
         return paths_between(t, req, chosen).is_some();
     }
     let set = order[i];
-    for cand in candidates(t, set, groups, taken, req.driver.as_ref(), None) {
+    let driver = req
+        .driver
+        .as_ref()
+        .filter(|_| req.driver_rule == Driver::First);
+    for cand in candidates(t, set, groups, taken, driver, None) {
         for n in &cand.nodes {
             taken.insert(n.clone());
         }
@@ -1615,6 +1642,11 @@ pub fn parse(shape: &Value) -> Result<Request, String> {
         sets,
         between,
         driver: None,
+        driver_rule: match &shape["driver"] {
+            Value::Null => Driver::First,
+            Value::String(s) => Driver::parse(s)?,
+            v => return Err(format!("driver must be first or ignore, got {v}")),
+        },
     })
 }
 
@@ -1839,6 +1871,7 @@ mod tests {
                 })
                 .collect(),
             driver: None,
+            driver_rule: Driver::First,
         }
     }
 
@@ -2641,6 +2674,13 @@ mod tests {
         assert!(m.prev.is_none() && m.next.is_none() && m.leaves.is_empty());
         assert_eq!(s.to_json(&t)["layouts"]["s"], "hops");
 
+        // Ignoring the driver takes the first layout that fits again: the
+        // star on F, with C a leaf.
+        r.driver_rule = Driver::Ignore;
+        let s = solve(&t, &r).unwrap();
+        assert_eq!(s.layouts["s"], Layout::Star);
+        assert_eq!(order(&s, "s")[0], "nF");
+
         let e = solve(&t, &any(9)).unwrap_err();
         assert!(e.contains("any layout of 9"), "{e}");
     }
@@ -2794,6 +2834,35 @@ mod tests {
             .contains("any layout"));
         assert!(parse(&shape("any", json!({"ports": "split"}))).is_ok());
         assert!(Layout::parse("hops").is_err());
+    }
+
+    #[test]
+    fn the_driver_rule_is_first_or_ignore() {
+        let shape = |driver: Value| {
+            let mut v = json!({"sets": [{"name": "s", "bundles": 2}]});
+            if !driver.is_null() {
+                v["driver"] = driver;
+            }
+            v
+        };
+        assert_eq!(
+            parse(&shape(Value::Null)).unwrap().driver_rule,
+            Driver::First
+        );
+        assert_eq!(
+            parse(&shape(json!("first"))).unwrap().driver_rule,
+            Driver::First
+        );
+        assert_eq!(
+            parse(&shape(json!("ignore"))).unwrap().driver_rule,
+            Driver::Ignore
+        );
+        assert!(parse(&shape(json!("last")))
+            .unwrap_err()
+            .contains("expected first or ignore"));
+        assert!(parse(&shape(json!(true)))
+            .unwrap_err()
+            .contains("first or ignore"));
     }
 
     /// Two boxes joined by two cables ring over both.

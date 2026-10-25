@@ -10,6 +10,22 @@ import os
 import time
 
 
+def vllm_rank_bundles(pg):
+    """The bundle index of each rank, as vLLM's RayExecutorV2 picks them in
+    _init_executor step 2 (ray_executor_v2.py:306, get_bundles_for_indices
+    and get_bundles_sorted_by_node in ray_utils.py, vLLM 487ecf187)."""
+    import ray
+    from ray.util import placement_group_table
+
+    listed = os.environ.get("VLLM_RAY_BUNDLE_INDICES", "")
+    if listed:
+        return [int(i) for i in listed.split(",")]
+    to_node = placement_group_table(pg)["bundles_to_node_id"]
+    driver = ray.get_runtime_context().get_node_id()
+    gpu = [i for i, b in enumerate(pg.bundle_specs) if b.get("GPU")]
+    return sorted(gpu, key=lambda i: (0 if to_node[i] == driver else 1, to_node[i]))
+
+
 class FakeWorker:
     def __init__(self, rank=0, fail_ctor=False):
         if fail_ctor:

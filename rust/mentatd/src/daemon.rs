@@ -2117,11 +2117,14 @@ pub fn try_place(st: &mut State, cv: &std::sync::Condvar) {
                 pg.claim.clone(),
             )
         };
-        let driver_node = st
-            .clients
-            .get(&owner)
-            .map(|c| c.node_id.clone())
-            .unwrap_or_default();
+        let driver_node = if ignores_driver(st, &group, &claim) {
+            String::new()
+        } else {
+            st.clients
+                .get(&owner)
+                .map(|c| c.node_id.clone())
+                .unwrap_or_default()
+        };
 
         let ordered = (!claim.is_empty())
             .then(|| claim_order(st, &group, &claim, &driver_node))
@@ -2361,6 +2364,15 @@ fn fit(
 /// For each rank in order: its node id, and the variables placement adds
 /// to its environment.
 type RankOrder = Vec<(String, BTreeMap<String, String>)>;
+
+/// Whether `claim` was asked with `"driver": "ignore"`. Its placement then
+/// leaves the driver's node out, the same as the solve did.
+fn ignores_driver(st: &State, group: &str, claim: &str) -> bool {
+    st.claims
+        .get(&(group.to_string(), claim.to_string()))
+        .and_then(|c| crate::claim::parse(&c.shape).ok())
+        .is_some_and(|r| r.driver_rule == crate::claim::Driver::Ignore)
+}
 
 /// The rank order for a claim of one ring, line or star set, as this
 /// driver needs it. None for any other claim.
@@ -3471,6 +3483,89 @@ mod tests {
         let st = with_star_claim(&["nB", "nA", "nC"]);
         let e = claim_order(&st, "g", "c", "nC").unwrap().unwrap_err();
         assert!(e.contains("hub on nb"), "{e}");
+    }
+
+    /// Places a group for claim `c`, with its driver on `driver_node`, and
+    /// returns the agents in bundle order, or None while it pends.
+    fn place_claimed(mut st: State, driver_node: &str) -> Option<Vec<String>> {
+        st.head_node_id = st.node_id.clone();
+        let mut st = with_driver(st, "drv");
+        st.clients.get_mut("drv").unwrap().node_id = driver_node.into();
+        let k = st.agents.len();
+        st.pgs.insert(
+            "p1".into(),
+            crate::state::PgInfo {
+                id: "p1".into(),
+                group: "g".into(),
+                owner: "drv".into(),
+                bundles: vec![1; k],
+                strategy: "PACK".into(),
+                assignment: vec![None; k],
+                state: crate::state::PgState::Pending,
+                created_ms: crate::state::now_ms_u64(),
+                fail_reason: None,
+                claim: "c".into(),
+                island: None,
+                pending_reason: None,
+                removed_ms: None,
+            },
+        );
+        super::try_place(&mut st, &std::sync::Condvar::new());
+        (st.pgs["p1"].state == crate::state::PgState::Created).then(|| {
+            st.pgs["p1"]
+                .assignment
+                .iter()
+                .map(|b| b.as_ref().unwrap().agent.clone())
+                .collect()
+        })
+    }
+
+    /// Asks claim `c` again with `"driver": "ignore"`.
+    fn ignoring_driver(mut st: State) -> State {
+        let c = st.claims.get_mut(&("g".into(), "c".into())).unwrap();
+        c.shape["driver"] = json!("ignore");
+        st
+    }
+
+    /// With the driver ignored, every ordered claim places in its solved
+    /// order wherever the driver sits.
+    #[test]
+    fn an_ignored_driver_keeps_the_solved_order() {
+        let ring = || with_ordered_claim("ring", &["nA", "nB", "nC", "nD"]);
+        assert_eq!(
+            place_claimed(ring(), "nC").unwrap(),
+            ["ag-nC", "ag-nD", "ag-nA", "ag-nB"]
+        );
+        assert_eq!(
+            place_claimed(ignoring_driver(ring()), "nC").unwrap(),
+            ["ag-nA", "ag-nB", "ag-nC", "ag-nD"]
+        );
+
+        let line = || with_ordered_claim("line", &["nA", "nB", "nC"]);
+        assert_eq!(place_claimed(line(), "nB"), None);
+        assert_eq!(
+            place_claimed(ignoring_driver(line()), "nB").unwrap(),
+            ["ag-nA", "ag-nB", "ag-nC"]
+        );
+
+        let star = || with_star_claim(&["nB", "nA", "nC"]);
+        assert_eq!(place_claimed(star(), "nC"), None);
+        assert_eq!(
+            place_claimed(ignoring_driver(star()), "nC").unwrap(),
+            ["ag-nB", "ag-nA", "ag-nC"]
+        );
+    }
+
+    /// A mesh claim puts the driver's node first, unless the claim ignores
+    /// the driver.
+    #[test]
+    fn an_ignored_driver_leaves_a_mesh_in_agent_order() {
+        let mesh = || with_ordered_claim("mesh", &["nA", "nB", "nC"]);
+        assert_eq!(place_claimed(mesh(), "nC").unwrap()[0], "ag-nC");
+        assert_eq!(
+            place_claimed(ignoring_driver(mesh()), "nC").unwrap(),
+            ["ag-nA", "ag-nB", "ag-nC"]
+        );
     }
 
     /// An `any` claim places as what it resolved to: a ring turns to the

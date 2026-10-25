@@ -257,6 +257,14 @@ reserve the GPUs. Two groups may claim one node and compete for its devices.
 | `ports?` | For a ring or a line: `auto` (the default), `split` or `same`. Any other layout refuses a value other than `auto` |
 | `vendor` | Pins the set to one GPU vendor. Without it the daemon picks one |
 
+The shape's `driver?` is `first` (the default) or `ignore`. With `first`, the
+node of the client that sent the claim steers the solve and the placement,
+as below, because vLLM's Ray executor needs the ranks on its driver's node
+to come first. With `ignore`, the answer and its order do not depend on who
+claims: `any` takes the first layout that fits, and placement keeps the
+view's order. A daemon that predates `driver` drops the key and solves as
+`first`.
+
 A `mesh` set is one island: every member links to every other. A `ring` set
 is an order of members in which each links to the next, and the last to the
 first. A `line` set is an order in which each links to the next. A `star`
@@ -268,17 +276,17 @@ it out. A mesh holds every ring and every star, a ring holds every line, and
 two members on one cable are all four.
 
 An `any` set is solved as a mesh, then a ring, a star and a line, and takes
-the first that fits. A star counts only with its hub on the claimant's
-node, and a line only with the claimant's node at one end, where that node
-is a member. Failing those, it takes `hops`: members that each link to
+the first that fits. With `driver: first`, a star counts only with its hub
+on the claimant's node, and a line only with the claimant's node at one end,
+where that node is a member. Failing those, it takes `hops`: members that each link to
 every other or reach it through at most `max_hops` other members, the first
 such set in node id order. `ports` applies when the answer is a ring or a
 line. The view's `layouts` gives each `any` set's answer: `mesh`, `ring`,
 `star`, `line` or `hops`. A daemon that does not know `any` refuses the claim with
 `bad_shape`.
 
-A star puts its hub on the node of the client that sent the claim when that
-node can be a hub. A daemon that does not know `star` refuses the claim with
+With `driver: first`, a star puts its hub on the node of the client that
+sent the claim when that node can be a hub. A daemon that does not know `star` refuses the claim with
 `bad_shape`.
 
 A daemon that predates `layout` drops the key and solves the set as a mesh.
@@ -359,11 +367,22 @@ A claim of one `any` set places as its answer: a ring, star or line as
 below, and a mesh or hops answer among its members in no order.
 
 A claim of one `ring`, `line` or `star` set places bundle `i` on member
-`i`, and needs one bundle per member. vLLM puts rank 0 on the driver's node.
-So a ring is turned to start at the driver's node, and a line is reversed
-when the driver is on its last member. A line with the driver on an inner
-member, or a star with the driver on a leaf, stays pending with the
-reason. Each rank's spawn `env` gives its position and names its
+`i`, and needs one bundle per member. With `driver: first`, a ring is turned
+to start at the driver's node, and a line is reversed when the driver is on
+its last member. A line with the driver on an inner member, or a star with
+the driver on a leaf, stays pending with the reason. With `driver: ignore`,
+the bundles follow the view's order. A mesh or hops answer puts the driver's
+node first under `first`, and keeps agent registration order under
+`ignore`.
+
+vLLM's broadcast queue takes the ranks on the driver's node to be rank 0
+onward, and a vLLM engine fails to start otherwise. A vLLM driver keeps
+`first`. For a claimed group, the shim sets `VLLM_RAY_BUNDLE_INDICES` to
+`0,1,...` so that vLLM's rank `i` is bundle `i`. Without it vLLM orders the
+nodes after the driver's by node id. A value the user set stays. The shim
+leaves the variable unset for a shape with `driver: ignore` or a bundle
+with no GPU. vLLM's own sort then puts the driver's node first. With the
+variable set, vLLM needs exactly one bundle per rank. Each rank's spawn `env` gives its position and names its
 neighbours (GUIDE.md, "Actor process"), and no rank gets
 `MENTAT_FABRIC_IP`.
 

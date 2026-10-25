@@ -494,12 +494,19 @@ export MENTAT_CLAIM=tp4 MENTAT_CLAIM_LAYOUT=ring
 vllm serve ... --distributed-executor-backend ray -tp 4
 ```
 
-Rank `i` of a ring, line or star sits on member `i`. The ring starts at
-the driver's node, where vLLM puts rank 0. A line starts at whichever end the
-driver is on. A star's hub is rank 0, and the daemon puts the hub on the
-driver's node when that node can be one. A driver on an inner node of a line,
-or on a star's leaf, leaves the group PENDING. Each rank gets its neighbours'
-addresses, listed under "Actor process".
+Rank `i` of a ring, line or star sits on member `i`. The shim sets
+`VLLM_RAY_BUNDLE_INDICES` for a claimed group, so vLLM's rank `i` is the same
+member. vLLM needs rank 0 on the driver's node when that node is a member,
+and fails to start otherwise. The ring therefore starts at the driver's
+node, and a line starts at whichever end the driver is on. A star's hub is
+rank 0, and the daemon puts the hub on the driver's node when that node can
+be one. A driver on an inner node of a line, or on a star's leaf, leaves
+the group PENDING. Each rank gets its neighbours' addresses, listed under
+"Actor process".
+
+A client other than vLLM can send `"driver": "ignore"` in the shape. The
+answer and its order then do not depend on which node claims, and no
+driver position leaves a group PENDING. A vLLM engine must not use it.
 
 A ring or line member with two ports can reach its two neighbours on
 different ports. Four boxes with their first port on a switch, and cabled in
@@ -519,9 +526,10 @@ roots. A set's `ports` picks the rule:
 
 An `any` set takes the first of mesh, ring, star and line that fits.
 Failing all four, it takes members that each reach every other directly or
-through one other member, a `hops` answer. A star counts only with its hub
-on the driver's node, and a line only with the driver at one end, where
-the driver is a member, since placement refuses the others. Six boxes on a
+through one other member, a `hops` answer. Unless the shape ignores the
+driver, a star counts only with its hub on the driver's node, and a line
+only with the driver at one end, where the driver is a member, since
+placement refuses the others. Six boxes on a
 switch with a seventh cabled to one of them are no mesh and no ring of
 seven. They are a star with its hub on the seventh box's neighbour, or,
 with the driver elsewhere, a line from the seventh box to the driver. The view's
@@ -861,7 +869,7 @@ of `MENTAT_FABRIC_IP`. No one address reaches every rank of a ring.
 | Variable | Value |
 | --- | --- |
 | `MENTAT_FABRIC_LAYOUT` | `ring`, `line` or `star` |
-| `MENTAT_FABRIC_RANK` | This rank's position in the claim's order, from 0 on the driver's node. It is the bundle index, which vLLM's Ray executor uses as the rank |
+| `MENTAT_FABRIC_RANK` | This rank's position in the claim's order, from 0. It is the bundle index, which `VLLM_RAY_BUNDLE_INDICES` makes vLLM's rank |
 | `MENTAT_FABRIC_SIZE` | The number of ranks in the claim's set |
 | `MENTAT_FABRIC_NEXT`, `MENTAT_FABRIC_PREV` | In a ring or a line, the next and previous rank's address on the cable to this rank |
 | `MENTAT_FABRIC_NEXT_IFACE`, `MENTAT_FABRIC_PREV_IFACE` | This rank's interface on that cable |
