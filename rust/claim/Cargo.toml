@@ -1,0 +1,21 @@
+[package]
+name = "mentat-claim"
+description = "Places sets of nodes on a probed cluster as a mesh, ring, line or star"
+readme = "README.md"
+keywords = ["cluster", "topology", "placement", "rdma", "nccl"]
+categories = ["algorithms", "command-line-utilities"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "mentat-claim"
+path = "src/main.rs"

@@ -68,7 +68,8 @@ jobs:
           c=$(docker create "mentat-artifacts:$VERSION")
           docker cp "$c:/out/." build/out
           docker rm "$c" > /dev/null
-          cp build/out/mentatd build/out/mentatd-serve build/out/mentatd-probe-machine \
+          cp build/out/mentatd build/out/mentatd-serve build/out/mentat-claim \
+            build/out/mentatd-probe-machine \
             README.md "build/$name/"
           tar -C build -czf "dist/$name.tar.gz" "$name"
           # The wheel is pure Python, so one architecture ships it.

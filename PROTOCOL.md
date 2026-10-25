@@ -237,6 +237,10 @@ against the probed topology and returns the set it chose. The name holds the
 reservation. Every holder gets the view the first claim produced, so ranks
 that start independently agree without a coordinator.
 
+The solver is the `mentat-claim` crate ([rust/claim/](rust/claim/)). Its
+library and its binary read the shapes and write the views described here,
+for a caller that probes its own cluster.
+
 A name belongs to the claiming client's group. Two groups that pick one name
 hold two claims. A claim chooses among the nodes where the claiming client's
 group has a live agent, since placement puts a group only on its own agents.
@@ -253,7 +257,7 @@ devices.
 
 | Field | Value |
 | --- | --- |
-| `bundles` | A count of nodes at one GPU each, or a list of GPUs per node |
+| `bundles` | A count of nodes at one GPU each, or a list of GPUs per node. At most 4096 nodes per set |
 | `link` | `rdma` or `ip`. An `rdma` set goes inside one fabric island (see "Placement") |
 | `layout?` | `mesh` (the default), `ring`, `line`, `star` or `any` |
 | `max_hops?` | For an `any` set, 1, the default. Any other value, and the key on another layout, are refused |

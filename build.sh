@@ -19,19 +19,20 @@ $DOCKER build --target runtime   -t "mentatd:${VERSION}" .
 $DOCKER build --target serve     -t "mentatd-serve:${VERSION}" .
 $DOCKER build --target all       -t "mentat:${VERSION}" .
 
-# What everything downstream depends on: the artifacts image holds both
+# What everything downstream depends on: the artifacts image holds the
 # binaries, the machine probe and exactly one shim wheel, and the binaries
 # are static.
 $DOCKER run --rm "mentat-artifacts:${VERSION}" sh -c '
   set -e
   /out/mentatd --version
   /out/mentatd-serve --version
+  /out/mentat-claim --version
   MENTAT_GPUS=1 /out/mentatd-probe-machine
   ls /out/mentatd-*-py3-none-any.whl
-  for b in /out/mentatd /out/mentatd-serve; do
+  for b in /out/mentatd /out/mentatd-serve /out/mentat-claim; do
     ! ldd "$b" 2>/dev/null | grep -q "=>" || { echo "$b is not static" >&2; exit 1; }
   done
-  echo "both binaries static"
+  echo "the binaries are static"
 '
 
 # `mentatd serve` only resolves where both binaries are installed.

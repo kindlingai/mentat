@@ -2,6 +2,21 @@
 
 The protocol stays at 0.99 in every release below.
 
+## Unreleased
+
+### Added
+
+- The claim solver is its own crate, `mentat-claim`, with typed `Shape`,
+  `Topology` and `View` structs and a `mentat-claim` binary that reads a
+  shape and a topology as JSON. mentatd solves claims with it. The
+  artifacts image, the release tarballs and crates.io carry it.
+
+### Fixed
+
+- A shape asking for more than 4096 members in one set is refused. A count
+  such as `"bundles": 1000000000` used to allocate one bundle per member
+  before the solve.
+
 ## 0.24.0 (2026-10-25)
 
 ### Changed

@@ -1421,21 +1421,14 @@ fn claim(
         c.holders.insert(client_id.to_string());
         return Ok((c.generation, c.view.clone()));
     }
-    let mut req = crate::claim::parse(shape).map_err(|e| Msg::refused("bad_shape", e))?;
-    req.driver = st.clients.get(client_id).map(|c| c.node_id.clone());
-    let mut topo = crate::claim::topology(st);
-    // Placement puts a group only on its own agents, so a claim solves over
-    // their nodes.
-    topo.free_gpus.retain(|n, _| {
-        st.agents
-            .values()
-            .any(|a| a.alive && a.group == group && a.node_id == *n)
-    });
-    let solution =
-        crate::claim::solve(&topo, &req).map_err(|e| Msg::refused("unsolvable_claim", e))?;
+    let refuse = |e: mentat_claim::Error| Msg::refused(e.code(), e.to_string());
+    let parsed = crate::claim::Shape::from_json(shape).map_err(refuse)?;
+    let driver = st.clients.get(client_id).map(|c| c.node_id.clone());
+    let topo = crate::claim::topology(st, group);
+    let view = mentat_claim::solve(&topo, &parsed, driver.as_deref()).map_err(refuse)?;
+    let view = serde_json::to_value(view).expect("a view serializes");
     st.claim_generation += 1;
     let generation = st.claim_generation;
-    let view = solution.to_json(&topo);
     st.claims.insert(
         key,
         ClaimInfo {
@@ -2390,8 +2383,8 @@ type RankOrder = Vec<(String, BTreeMap<String, String>)>;
 fn ignores_driver(st: &State, group: &str, claim: &str) -> bool {
     st.claims
         .get(&(group.to_string(), claim.to_string()))
-        .and_then(|c| crate::claim::parse(&c.shape).ok())
-        .is_some_and(|r| r.driver_rule == crate::claim::Driver::Ignore)
+        .and_then(|c| crate::claim::Shape::from_json(&c.shape).ok())
+        .is_some_and(|s| s.driver == crate::claim::Driver::Ignore)
 }
 
 /// The rank order for a claim of one ring, line or star set, as this
@@ -2410,8 +2403,8 @@ fn claim_order(
 ) -> Option<Result<RankOrder, String>> {
     use crate::claim::Layout;
     let c = st.claims.get(&(group.to_string(), claim.to_string()))?;
-    let req = crate::claim::parse(&c.shape).ok()?;
-    let [set] = req.sets.as_slice() else {
+    let shape = crate::claim::Shape::from_json(&c.shape).ok()?;
+    let [set] = shape.sets.as_slice() else {
         return None;
     };
     // An `any` set places as what it resolved to. A mesh or hops answer has

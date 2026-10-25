@@ -30,6 +30,7 @@ its own MessageQueue and NCCL, and after boot the only recurring Ray call is
 | --- | --- | --- | --- |
 | `mentatd` | [rust/mentatd/](rust/mentatd/), [crates.io](https://crates.io/crates/mentatd) | Daemon, agent and CLI in one binary | 1.7 MiB on disk, ~2.5 MiB RSS |
 | `mentatd-serve` | [rust/mentatd-serve/](rust/mentatd-serve/), [crates.io](https://crates.io/crates/mentatd-serve) | Router, its own crate and container | 1.7 MiB on disk, ~3.2 MiB RSS |
+| `mentat-claim` | [rust/claim/](rust/claim/) | The claim solver, as a library and a JSON command-line tool | |
 | `mentat-common` | [rust/common/](rust/common/) | Announcement signing and logging, shared by both binaries | |
 | `ray` shim | [python/](python/) | Pure-Python package claiming the `ray` import name | ~2 MiB in a running interpreter |
 
@@ -51,7 +52,7 @@ cargo install mentatd mentatd-serve
 pip wheel --no-deps -w dist ./python
 ```
 
-The wheel is not on PyPI. The published artifacts image has both binaries
+The wheel is not on PyPI. The published artifacts image has the binaries
 and the wheel:
 
 ```
@@ -62,7 +63,7 @@ Each published image covers linux/amd64 and linux/arm64. Docker Hub has
 the same images as `mmastrac/<image>`, such as
 `mmastrac/mentat-artifacts:0.24.0`. Each
 [GitHub release](https://github.com/kindlingai/mentat/releases) also carries
-the static binaries for both, the wheel and their SHA256SUMS.
+the static binaries, the wheel and their SHA256SUMS.
 
 Building every image locally:
 

@@ -3,6 +3,7 @@
 #   --target artifacts  ->  mentat-artifacts:<ver>
 #       /out/mentatd                        the static daemon/CLI binary
 #       /out/mentatd-serve                  the static router binary
+#       /out/mentat-claim                   the static claim solver binary
 #       /out/mentatd-probe-machine          the GPU/memory inventory probe
 #       /out/mentatd-*.whl                  the pure-Python `ray` shim
 #       Consumed by the model images via COPY --from. Never runs.
@@ -36,7 +37,7 @@ COPY rust/ /src/
 # --locked would need a committed Cargo.lock from the same cargo major; the
 # assertions after the build are what actually gate the output.
 RUN cargo build --release --workspace \
-    && for b in mentatd mentatd-serve; do \
+    && for b in mentatd mentatd-serve mentat-claim; do \
          ./target/release/$b --version || exit 1; \
          if ldd target/release/$b 2>/dev/null | grep -q '=>'; then \
            echo "$b is not static" >&2; exit 1; \
@@ -53,14 +54,15 @@ RUN pip wheel --no-deps -w /dist . \
 
 FROM ${RUNTIME_IMAGE} AS artifacts
 LABEL org.opencontainers.image.title="mentat-artifacts" \
-      org.opencontainers.image.description="mentatd, mentatd-serve and the ray shim wheel, for COPY --from" \
+      org.opencontainers.image.description="mentatd, mentatd-serve, mentat-claim and the ray shim wheel, for COPY --from" \
       org.opencontainers.image.source="https://github.com/kindlingai/mentat" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 COPY --from=build /src/target/release/mentatd /out/mentatd
 COPY --from=build /src/target/release/mentatd-serve /out/mentatd-serve
+COPY --from=build /src/target/release/mentat-claim /out/mentat-claim
 COPY scripts/mentatd-probe-machine /out/mentatd-probe-machine
 COPY --from=wheel /dist/ /out/
-RUN /out/mentatd --version && /out/mentatd-serve --version \
+RUN /out/mentatd --version && /out/mentatd-serve --version && /out/mentat-claim --version \
     && MENTAT_GPUS=1 /out/mentatd-probe-machine \
     && ls /out/mentatd-*-py3-none-any.whl
 

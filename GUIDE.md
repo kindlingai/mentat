@@ -543,6 +543,9 @@ members and the fewest-hop paths between members with no link
 (PROTOCOL.md, "claim"). A caller with its own rules for which link carries
 what, such as a relay over a second PCI root, reads them there.
 
+`mentat-claim solve` runs the same solver on a topology from stdin, with no
+daemon (rust/claim/README.md).
+
 ## Environment
 
 An unset or empty variable uses its default. An unparsable `*_MS` value
