@@ -523,6 +523,14 @@ roots. A set's `ports` picks the rule:
 | `split` | On different ports, or the claim is refused |
 | `same` | On one port, or the claim is refused |
 
+A mesh takes `same` (and `auto`) or `split`. `same` keeps the mesh in one
+island, one port per member. `split` spreads each pair's traffic over every
+direct link the pair has, so a pair with its own cable uses the cable
+before the switch. A `split` mesh of two picks a cabled pair over a pair
+that shares only the switch, and puts a quarter of its traffic on each of
+the cable's and the switch's two roots. The view's `links` rows carry each
+link's `share` (PROTOCOL.md, "claim").
+
 `MENTAT_CLAIM_PORTS` sets it without writing a shape.
 
 An `any` set takes the first of mesh, ring, star and line that fits.
@@ -807,8 +815,8 @@ when `MENTAT_CLAIM_SHAPE` is set, since that shape names its own. See
 
 - `MENTAT_CLAIM_PORTS` (default: `auto`)
 
-The default shape's `ports`: `auto`, `split` or `same`. Applies to a ring or
-a line. Ignored when `MENTAT_CLAIM_SHAPE` is set. See "Claims".
+The default shape's `ports`: `auto`, `split` or `same`. Applies to a mesh, a
+ring or a line. Ignored when `MENTAT_CLAIM_SHAPE` is set. See "Claims".
 
 - `MENTAT_GPUS` (default: what `nvidia-smi` reports)
 

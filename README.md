@@ -113,6 +113,72 @@ mentatd status
 are compose files for the daemon and the router. Both need `network_mode:
 host`.
 
+## Claims
+
+A claim reserves nodes and links under a name. The head solves the claim
+once. Each holder gets the same view. Set `MENTAT_CLAIM` and
+`MENTAT_CLAIM_SHAPE` for vLLM, or send `claim` ([PROTOCOL.md](PROTOCOL.md)).
+The [mentat-claim](rust/claim/) crate runs the same solver without a daemon.
+
+```json
+{"sets": [{"name": "tp", "bundles": 4, "link": "rdma", "layout": "ring"}]}
+```
+
+### Layouts
+
+| Layout | Rule | |
+| --- | --- | --- |
+| `mesh` | Each member links to each other member. This is the default. | <img src="docs/claims/mesh.svg" width="160" alt="mesh"> |
+| `ring` | Each member links to the next member. The last member links to the first. | <img src="docs/claims/ring.svg" width="160" alt="ring"> |
+| `line` | Each member links to the next member. | <img src="docs/claims/line.svg" width="160" alt="line"> |
+| `star` | The hub links to each leaf. The hub is member 0. | <img src="docs/claims/star.svg" width="160" alt="star"> |
+| `any` | The first fit of mesh, ring, star and line. Then `hops`: each member reaches each other member directly or through one member. `layouts` in the view gives the result. | <img src="docs/claims/hops.svg" width="160" alt="hops"> |
+
+### Set options
+
+| Option | Values | Default | Effect |
+| --- | --- | --- | --- |
+| `name` | text | | Names the set in the view. |
+| `bundles` | count, or GPUs per node | | One member per node. A count gives 1 GPU per member. |
+| `link` | `rdma`, `ip` | `ip` | `rdma` uses only ports tagged `rdma`. |
+| `layout` | above | `mesh` | |
+| `ports` | `auto`, `split`, `same` | `auto` | See "Ports". A star refuses it. |
+| `max_hops` | `1` | `1` | For `any` only. |
+| `vendor` | GPU vendor | first fit | Puts the set on one vendor. |
+
+### Shape options
+
+| Option | Values | Default | Effect |
+| --- | --- | --- | --- |
+| `between` | `{from, to, link}` | none | Needs a link of `link` between two sets. |
+| `driver` | `first`, `ignore` | `first` | `first` puts rank 0 on the claimant's node. vLLM needs this. `ignore` keeps the solved order. |
+
+<img src="docs/claims/between.svg" width="280" alt="two rdma sets with an ip link between them">
+
+### Ports
+
+A port is one address group on a node. Two addresses on one wire are one
+port. Each PCIe root is a separate port.
+
+Ring and line:
+
+| `ports` | Each member reaches its two neighbours |
+| --- | --- |
+| `auto` | On different ports if possible, else on the best links |
+| `split` | On different ports, or the claim fails |
+| `same` | On one port, or the claim fails |
+
+<img src="docs/claims/ring-split.svg" width="260" alt="a split ring over cables and a switch">
+
+Mesh:
+
+| `ports` | Effect |
+| --- | --- |
+| `same` (and `auto`) | Each member uses one port for all members. An `rdma` set stays in one island, usually the switch. |
+| `split` | Each pair spreads its traffic over all its direct links. A cable carries its pair's traffic before the switch. The solver picks the nodes with the least load on the busiest port. Each link in `links` gets a `share`. At most 64 members. |
+
+<img src="docs/claims/mesh-ports.svg" width="480" alt="mesh ports same and split">
+
 ## Documentation
 
 - [GUIDE.md](GUIDE.md): the `mentatd` manual. Commands, environment,

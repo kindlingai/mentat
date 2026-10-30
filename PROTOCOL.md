@@ -261,7 +261,7 @@ devices.
 | `link` | `rdma` or `ip`. An `rdma` set goes inside one fabric island (see "Placement") |
 | `layout?` | `mesh` (the default), `ring`, `line`, `star` or `any` |
 | `max_hops?` | For an `any` set, 1, the default. Any other value, and the key on another layout, are refused |
-| `ports?` | For a ring or a line: `auto` (the default), `split` or `same`. Any other layout refuses a value other than `auto` |
+| `ports?` | `auto` (the default), `split` or `same`. A star refuses a value other than `auto`. A `split` mesh has at most 64 nodes |
 | `vendor` | Pins the set to one GPU vendor. Without it the daemon picks one |
 
 The shape's `driver?` is `first` (the default) or `ignore`. With `first`, the
@@ -287,8 +287,8 @@ the first that fits. With `driver: first`, a star counts only with its hub
 on the claimant's node, and a line only with the claimant's node at one end,
 where that node is a member. Failing those, it takes `hops`: members that each link to
 every other or reach it through at most `max_hops` other members, the first
-such set in node id order. `ports` applies when the answer is a ring or a
-line. The view's `layouts` gives each `any` set's answer: `mesh`, `ring`,
+such set in node id order. `ports` applies when the answer is a mesh, a
+ring or a line. The view's `layouts` gives each `any` set's answer: `mesh`, `ring`,
 `star`, `line` or `hops`. A daemon that does not know `any` refuses the claim with
 `bad_shape`.
 
@@ -307,6 +307,19 @@ each step. A ring or line search stops after 20,000 steps. A large cluster
 can then refuse a `split` or `same` set that has an answer, and `auto` then
 falls back. A daemon that predates `ports` drops the key and solves as
 `auto` without the split preference.
+
+On a mesh, `same` and `auto` place the set in one island, with one port
+per member. `split` spreads each pair's traffic over every direct link
+between the pair, a link the prober did not mark `direct: false`. Every
+pair of members needs one. Pairs with the fewest links go first. Each
+twelfth of a pair's traffic goes on the link whose busier end then carries
+the least. A pair's own cable then takes its traffic before a switch port
+that carries other pairs. A tie goes to the link whose ports reach the fewest
+nodes, then to the lower round trip. Each address group counts as one port
+of equal speed. The solver scores at most 64 node sets in node id order and
+takes the one with the least load on its busiest port, then the least load
+on ports that reach more than one node. A daemon before 0.26.0 refuses
+`ports` on a mesh with `bad_shape`.
 
 ```json
 {"t": "claim_ok", "name": "myjob", "generation": 3, "head_node_id": "...",
@@ -334,7 +347,7 @@ falls back. A daemon that predates `ports` drops the key and solves as
 A ring, a line or a star lists its members in order. A ring starts at its
 lowest node id. A star starts at its hub.
 
-For a ring, line, star or any set, the view also has `links` and `paths`, each
+For a ring, line, star, any or `split` mesh set, the view also has `links` and `paths`, each
 keyed by set name. They are facts about the set's members and the probes,
 and the caller applies its own policy to them. Both stay the same whatever
 the layout's order, `ports`, the driver's node or a rotation.
@@ -342,6 +355,7 @@ the layout's order, `ports`, the driver's node or a rotation.
 | Field | Value |
 | --- | --- |
 | `links` | Every probed, non-forwarded link between two members that meets the set's `link`, once each. `a` and `b` are the ends, `a` on the lower node id, each with `node`, `host`, `addr`, `iface` and `port`. `rtt_ms` is the probe's round trip. Sorted by node ids, then addresses |
+| `share?` | In a `split` mesh, on each `links` row: the fraction of the pair's traffic the link carries. A pair's shares add up to 1. 0 marks a link left unused |
 | `paths` | For each ordered pair of members with no link between them, every fewest-hop path through the set's own members, as node ids from the first member to the last: `paths[set][from][to]`. Sorted, at most 64 per pair |
 
 A link's `port` is its end's port group, named by the lowest address in it.

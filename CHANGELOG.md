@@ -2,6 +2,18 @@
 
 The protocol stays at 0.99 in every release below.
 
+## Unreleased
+
+### Added
+
+- A mesh set takes `ports`. `same`, and `auto` on a mesh, keep the current
+  placement. `split` spreads each pair's traffic over every direct link
+  between the pair, so a cabled pair uses its cable before the switch. The
+  solver picks the node set whose busiest port carries the least, so a
+  `split` mesh of two takes a cabled pair. Each `links` row of a `split`
+  mesh carries a `share`. A `split` mesh has at most 64 members.
+- The README lists the claim layouts and options, with diagrams.
+
 ## 0.25.0 (2026-10-25)
 
 ### Added

@@ -309,6 +309,9 @@ pub struct LinkFact {
     pub a_group: String,
     pub b_group: String,
     pub rtt_ms: u64,
+    /// In a `split` mesh, how many of its pair's SPLIT_PARTS parts go on
+    /// this link.
+    pub share: Option<u32>,
 }
 
 /// A pair of members has at most this many paths listed. Dense sets have
@@ -351,6 +354,7 @@ fn facts(t: &Graph, set: &SetReq, groups: &BTreeMap<String, String>, nodes: &[No
                 a_port: p.local,
                 b_port: p.remote,
                 rtt_ms: p.rtt_ms,
+                share: None,
             }));
         }
     }
@@ -487,6 +491,7 @@ impl Solution {
                         a: link_end(&l.a, &l.a_port, &l.a_group),
                         b: link_end(&l.b, &l.b_port, &l.b_group),
                         rtt_ms: l.rtt_ms,
+                        share: l.share.map(|p| f64::from(p) / f64::from(SPLIT_PARTS)),
                     })
                     .collect();
                 (k.clone(), rows)
@@ -628,6 +633,9 @@ fn candidates(
         }
         return out;
     }
+    if set.ports == Ports::Split {
+        return split_meshes(t, set, groups, taken);
+    }
     let want = set.bundles.len();
     let fits = |n: &NodeId, i: usize| {
         !taken.contains(n) && t.free_gpus.get(n).copied().unwrap_or(0.0) >= set.bundles[i]
@@ -690,6 +698,156 @@ fn candidates(
             }
         }
     }
+}
+
+/// A pair's traffic in a `split` mesh comes in this many parts. 12 divides
+/// evenly over 1, 2, 3, 4 or 6 links.
+pub const SPLIT_PARTS: u32 = 12;
+
+/// A `split` mesh scores at most this many node sets.
+const MAX_SPLIT_SETS: usize = 64;
+
+/// Node sets for a `split` mesh, best first: `want` free nodes with a link
+/// between every pair, ranked by the score `spread` gives them. The search
+/// takes nodes in node id order. It stops after MAX_SPLIT_SETS sets or
+/// MAX_STEPS steps.
+fn split_meshes(
+    t: &Graph,
+    set: &SetReq,
+    groups: &BTreeMap<String, String>,
+    taken: &BTreeSet<NodeId>,
+) -> Vec<Cand> {
+    let want = set.bundles.len();
+    if want > crate::shape::MAX_SPLIT_MEMBERS {
+        return Vec::new();
+    }
+    let nodes: Vec<&NodeId> = t.free_gpus.keys().filter(|n| !taken.contains(*n)).collect();
+    let mut linked: BTreeSet<(&NodeId, &NodeId)> = BTreeSet::new();
+    for (i, &a) in nodes.iter().enumerate() {
+        for &b in &nodes[i + 1..] {
+            if t.path(a, b, set.link, true).is_some() {
+                linked.insert((a, b));
+                linked.insert((b, a));
+            }
+        }
+    }
+    let fits = |n: &NodeId, i: usize| t.free_gpus.get(n).copied().unwrap_or(0.0) >= set.bundles[i];
+    let mut found: Vec<Vec<NodeId>> = Vec::new();
+    let mut stack: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut steps = 0;
+    while let Some(chosen) = stack.pop() {
+        steps += 1;
+        if found.len() >= MAX_SPLIT_SETS || steps > MAX_STEPS {
+            break;
+        }
+        if chosen.len() == want {
+            found.push(chosen.iter().map(|&i| nodes[i].clone()).collect());
+            continue;
+        }
+        let start = chosen.last().map_or(0, |&i| i + 1);
+        // Push in reverse. The lowest node id then comes off the stack first.
+        for i in (start..nodes.len()).rev() {
+            let n = nodes[i];
+            if nodes.len() - i >= want - chosen.len()
+                && fits(n, chosen.len())
+                && chosen.iter().all(|&j| linked.contains(&(nodes[j], n)))
+            {
+                let mut next = chosen.clone();
+                next.push(i);
+                stack.push(next);
+            }
+        }
+    }
+    let reach = port_reach(t, set.link, groups);
+    let mut scored: Vec<((u32, u32), Vec<NodeId>)> = found
+        .into_iter()
+        .map(|nodes| (spread(&facts(t, set, groups, &nodes), &reach).1, nodes))
+        .collect();
+    scored.sort_by_key(|s| s.0);
+    scored
+        .into_iter()
+        .map(|(_, nodes)| Cand {
+            nodes,
+            links: Vec::new(),
+            layout: Layout::Mesh,
+        })
+        .collect()
+}
+
+/// Maps each port group to the number of nodes at the far end of its
+/// non-forwarded links over `link`. A cable's group reaches one node. A switch port's group
+/// reaches every box on the switch.
+fn port_reach(t: &Graph, link: Link, groups: &BTreeMap<String, String>) -> BTreeMap<String, usize> {
+    let mut owner: BTreeMap<&str, (&NodeId, &Port)> = BTreeMap::new();
+    for (n, ps) in &t.ports {
+        for p in ps {
+            owner.insert(&p.addr, (n, p));
+        }
+    }
+    let group = |a: &String| groups.get(a).cloned().unwrap_or_else(|| a.clone());
+    let mut far: BTreeMap<String, BTreeSet<&NodeId>> = BTreeMap::new();
+    for (a, b) in t.links.keys() {
+        let (Some(&(na, pa)), Some(&(nb, pb))) = (owner.get(a.as_str()), owner.get(b.as_str()))
+        else {
+            continue;
+        };
+        if na == nb || t.is_forwarded(a, b) || (link == Link::Rdma && !(pa.rdma() && pb.rdma())) {
+            continue;
+        }
+        far.entry(group(a)).or_default().insert(nb);
+        far.entry(group(b)).or_default().insert(na);
+    }
+    far.into_iter().map(|(g, n)| (g, n.len())).collect()
+}
+
+/// Spreads each pair's traffic over the pair's links in `f`, and returns
+/// the parts each link carries, out of SPLIT_PARTS, with the score: the
+/// busiest port's load, then the load on ports that reach more than one
+/// node.
+///
+/// Pairs with the fewest links go first. A pair with a cable of its own
+/// then comes after the shared ports carry the other pairs, and the cable
+/// takes its traffic. Each part goes to the link whose busier end then
+/// carries the least. Ties go to the link whose ports reach the fewest
+/// nodes, then to the lower round trip, then to the first row.
+fn spread(f: &Facts, reach: &BTreeMap<String, usize>) -> (Vec<u32>, (u32, u32)) {
+    let mut pairs: BTreeMap<(&NodeId, &NodeId), Vec<usize>> = BTreeMap::new();
+    for (i, l) in f.links.iter().enumerate() {
+        pairs.entry((&l.a, &l.b)).or_default().push(i);
+    }
+    let mut order: Vec<_> = pairs.into_iter().collect();
+    order.sort_by_key(|(pair, rows)| (rows.len(), *pair));
+    let reach_of = |g: &str| reach.get(g).copied().unwrap_or(1);
+    let mut load: BTreeMap<&str, u32> = BTreeMap::new();
+    let mut parts = vec![0; f.links.len()];
+    for (_, rows) in &order {
+        for _ in 0..SPLIT_PARTS {
+            let Some(&best) = rows.iter().min_by_key(|&&i| {
+                let l = &f.links[i];
+                let on = |g: &str| load.get(g).copied().unwrap_or(0);
+                let busier = on(&l.a_group).max(on(&l.b_group)) + 1;
+                (
+                    busier,
+                    reach_of(&l.a_group) + reach_of(&l.b_group),
+                    l.rtt_ms,
+                    i,
+                )
+            }) else {
+                continue;
+            };
+            parts[best] += 1;
+            let l = &f.links[best];
+            *load.entry(&l.a_group).or_default() += 1;
+            *load.entry(&l.b_group).or_default() += 1;
+        }
+    }
+    let busiest = load.values().max().copied().unwrap_or(0);
+    let shared = load
+        .iter()
+        .filter(|(g, _)| reach_of(g) > 1)
+        .map(|(_, v)| v)
+        .sum();
+    (parts, (busiest, shared))
 }
 
 /// The node sets for an `any` set's fallback: `want` free nodes, each
@@ -1290,11 +1448,21 @@ pub fn solve(t: &Graph, req: &Request) -> Result<Solution, String> {
     }
     let between =
         paths_between(t, req, &chosen).ok_or("no probed link satisfies a between entry")?;
+    let split = |s: &SetReq| s.ports == Ports::Split && chosen[&s.name].layout == Layout::Mesh;
     let facts = req
         .sets
         .iter()
-        .filter(|s| s.layout.ordered() || s.layout == Layout::Any)
-        .map(|s| (s.name.clone(), facts(t, s, &groups, &chosen[&s.name].nodes)))
+        .filter(|s| s.layout.ordered() || s.layout == Layout::Any || split(s))
+        .map(|s| {
+            let mut f = facts(t, s, &groups, &chosen[&s.name].nodes);
+            if split(s) {
+                let (parts, _) = spread(&f, &port_reach(t, s.link, &groups));
+                for (l, p) in f.links.iter_mut().zip(parts) {
+                    l.share = Some(p);
+                }
+            }
+            (s.name.clone(), f)
+        })
         .collect();
     let layouts = req
         .sets
@@ -1413,6 +1581,19 @@ fn why_not(t: &Graph, req: &Request) -> String {
                 "set {:?} wants a {} of {want} nodes, {how} over {} links, and {order}",
                 s.name,
                 s.layout.name(),
+                if s.link == Link::Rdma {
+                    "rdma"
+                } else {
+                    "probed"
+                },
+            ));
+            continue;
+        }
+        if s.ports == Ports::Split {
+            parts.push(format!(
+                "set {:?} wants a split mesh of {want} nodes, and no {want} free nodes \
+                 each have a direct {} link to every other",
+                s.name,
                 if s.link == Link::Rdma {
                     "rdma"
                 } else {
@@ -3297,6 +3478,166 @@ mod tests {
                 .insert((format!("10.60.0.{i}"), format!("10.60.0.{}", i + 1)), 0);
         }
         t
+    }
+
+    /// Four boxes on a switch with two roots, 10.100 and 10.101.
+    /// Boxes `a` and `b` also share a cable with two roots, 10.110 and 10.111.
+    fn switch_and_cable(a: usize, b: usize) -> Graph {
+        let mut t = crate::topology::Topology::default();
+        let port = |addr: String| Port {
+            addr,
+            iface: None,
+            tags: vec!["rdma".into()],
+        };
+        for i in 0..4 {
+            let mut ports = vec![port(format!("10.100.0.{i}")), port(format!("10.101.0.{i}"))];
+            if i == a || i == b {
+                ports.push(port(format!("10.110.0.{i}")));
+                ports.push(port(format!("10.111.0.{i}")));
+            }
+            t.nodes.insert(
+                format!("n{i}"),
+                crate::topology::Node {
+                    ports,
+                    free_gpus: Some(1),
+                    ..Default::default()
+                },
+            );
+        }
+        let mut probe = |from: String, to: String| {
+            t.probes.push(crate::topology::Probe {
+                from,
+                to,
+                ok: true,
+                rtt_ms: 1,
+                direct: Some(true),
+            })
+        };
+        for net in [100, 101] {
+            for i in 0..4 {
+                for j in 0..4 {
+                    if i != j {
+                        probe(format!("10.{net}.0.{i}"), format!("10.{net}.0.{j}"));
+                    }
+                }
+            }
+        }
+        for net in [110, 111] {
+            probe(format!("10.{net}.0.{a}"), format!("10.{net}.0.{b}"));
+            probe(format!("10.{net}.0.{b}"), format!("10.{net}.0.{a}"));
+        }
+        Graph::new(&t)
+    }
+
+    fn mesh(k: usize, ports: &str) -> Request {
+        parse(&json!({"sets": [{"name": "s", "bundles": k, "link": "rdma", "ports": ports}]}))
+            .unwrap()
+    }
+
+    /// Each link's share of its pair's traffic, by its two addresses.
+    fn shares(v: &Value) -> BTreeMap<String, f64> {
+        v["links"]["s"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                let key = format!(
+                    "{}-{}",
+                    l["a"]["addr"].as_str().unwrap(),
+                    l["b"]["addr"].as_str().unwrap()
+                );
+                (key, l["share"].as_f64().unwrap())
+            })
+            .collect()
+    }
+
+    fn members(v: &Value) -> Vec<&str> {
+        v["sets"]["s"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["node"].as_str().unwrap())
+            .collect()
+    }
+
+    /// A split mesh of two takes the cabled pair and spreads its traffic
+    /// over the cable and the switch, on both roots. The default mesh takes
+    /// the first pair in the island, and its view omits `links`.
+    #[test]
+    fn a_split_mesh_of_two_takes_the_cable() {
+        let t = switch_and_cable(0, 2);
+        let v = solve(&t, &mesh(2, "split")).unwrap().to_json(&t);
+        assert_eq!(members(&v), ["n0", "n2"]);
+        let s = shares(&v);
+        assert_eq!(s.len(), 4, "{s:?}");
+        assert!(s.values().all(|x| *x == 0.25), "{s:?}");
+
+        for ports in ["same", "auto"] {
+            let v = solve(&t, &mesh(2, ports)).unwrap().to_json(&t);
+            assert_eq!(members(&v), ["n0", "n1"], "{ports}");
+            assert!(v["links"].get("s").is_none(), "{ports}");
+        }
+    }
+
+    /// In a split mesh of four, the cabled pair's traffic goes on the cable,
+    /// and the switch ports carry the other pairs, half on each root. The
+    /// cabled pair is the first pair in node id order, so it is spread
+    /// only after the pairs with fewer links.
+    #[test]
+    fn a_split_mesh_puts_a_cabled_pair_on_its_cable() {
+        let t = switch_and_cable(0, 1);
+        let v = solve(&t, &mesh(4, "split")).unwrap().to_json(&t);
+        let s = shares(&v);
+        for (key, share) in &s {
+            let want = match key.as_str() {
+                "10.110.0.0-10.110.0.1" | "10.111.0.0-10.111.0.1" => 0.5,
+                "10.100.0.0-10.100.0.1" | "10.101.0.0-10.101.0.1" => 0.0,
+                _ => 0.5,
+            };
+            assert_eq!(*share, want, "{key}: {s:?}");
+        }
+        // Every pair's shares add up to 1.
+        let mut by_pair: BTreeMap<(&str, &str), f64> = BTreeMap::new();
+        for l in v["links"]["s"].as_array().unwrap() {
+            let pair = (
+                l["a"]["node"].as_str().unwrap(),
+                l["b"]["node"].as_str().unwrap(),
+            );
+            *by_pair.entry(pair).or_default() += l["share"].as_f64().unwrap();
+        }
+        assert_eq!(by_pair.len(), 6);
+        assert!(
+            by_pair.values().all(|x| (x - 1.0).abs() < 1e-9),
+            "{by_pair:?}"
+        );
+    }
+
+    /// A split mesh needs a direct link between every pair.
+    #[test]
+    fn a_split_mesh_needs_every_pair_linked() {
+        let mut t = switch_and_cable(0, 2);
+        // n1 and n3 keep only the 10.100 root, and lose each other there.
+        for (a, b) in [("10.100.0.1", "10.100.0.3"), ("10.100.0.3", "10.100.0.1")] {
+            t.links.remove(&(a.to_string(), b.to_string()));
+        }
+        for n in ["n1", "n3"] {
+            t.ports
+                .get_mut(n)
+                .unwrap()
+                .retain(|p| p.addr.starts_with("10.100."));
+        }
+        let v = solve(&t, &mesh(3, "split")).unwrap().to_json(&t);
+        assert_eq!(members(&v), ["n0", "n1", "n2"]);
+        let e = solve(&t, &mesh(4, "split")).unwrap_err();
+        assert!(e.contains("split mesh of 4 nodes"), "{e}");
+    }
+
+    #[test]
+    fn a_split_mesh_has_a_size_cap() {
+        let big = json!({"sets": [{"name": "s", "bundles": 65, "ports": "split"}]});
+        assert!(parse(&big).unwrap_err().contains("at most 64"));
+        let ok = json!({"sets": [{"name": "s", "bundles": 65, "ports": "same"}]});
+        assert!(parse(&ok).is_ok());
     }
 
     #[test]

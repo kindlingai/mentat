@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="150" viewBox="0 0 200 150" role="img"><title>line: each member links to the next</title><style>
+.n{fill:#ffffff;stroke:#57606a;stroke-width:1.5}
+.h{fill:#ddf4ff;stroke:#0969da;stroke-width:1.5}
+.t{fill:#1f2328;font:12px sans-serif;text-anchor:middle;dominant-baseline:central}
+.c{fill:#57606a;font:11px sans-serif;text-anchor:middle}
+.l{stroke:#57606a;stroke-width:2;fill:none}
+.sw{stroke:#0969da;stroke-width:2;fill:none}
+.cb{stroke:#bc4c00;stroke-width:3;fill:none}
+.d{stroke:#8c959f;stroke-width:1.5;stroke-dasharray:4 3;fill:none}
+.box{fill:#f6f8fa;stroke:#0969da;stroke-width:1.5}
+.g{fill:none;stroke:#8c959f;stroke-width:1;stroke-dasharray:3 3}
+@media (prefers-color-scheme: dark){
+.n{fill:#0d1117;stroke:#9198a1}
+.h{fill:#0c2d6b;stroke:#4493f8}
+.t{fill:#f0f6fc}
+.c{fill:#9198a1}
+.l{stroke:#9198a1}
+.sw{stroke:#4493f8}
+.cb{stroke:#f0883e}
+.d{stroke:#656c76}
+.box{fill:#161b22;stroke:#4493f8}
+.g{stroke:#656c76}
+}
+</style><line class="l" x1="30" y1="70" x2="77" y2="70"/><line class="l" x1="77" y1="70" x2="124" y2="70"/><line class="l" x1="124" y1="70" x2="171" y2="70"/><circle class="n" cx="30" cy="70" r="15"/><text class="t" x="30" y="70">0</text><circle class="n" cx="77" cy="70" r="15"/><text class="t" x="77" y="70">1</text><circle class="n" cx="124" cy="70" r="15"/><text class="t" x="124" y="70">2</text><circle class="n" cx="171" cy="70" r="15"/><text class="t" x="171" y="70">3</text><text class="c" x="100" y="143">line</text></svg>

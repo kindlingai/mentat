@@ -10,6 +10,10 @@ use crate::Error;
 /// per member, so a larger one would only allocate.
 pub const MAX_MEMBERS: usize = 4096;
 
+/// A `split` mesh has at most this many members. The solver spreads every
+/// pair's traffic for each node set it scores.
+pub const MAX_SPLIT_MEMBERS: usize = 64;
+
 /// What a set needs of the links between its own members.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Link {
@@ -99,15 +103,19 @@ impl<'de> Deserialize<'de> for Layout {
     }
 }
 
-/// Which ports a ring or line member reaches its two neighbours by.
+/// Which ports a member reaches the other members by.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Ports {
-    /// Split where some ring or line allows it, else any.
+    /// For a ring or a line, split where some ring or line allows it, else
+    /// any. For a mesh, `Same`.
     #[default]
     Auto,
-    /// Different ports for the two neighbours.
+    /// A ring or line member reaches its two neighbours by different
+    /// ports. A mesh spreads each pair's traffic over every direct link
+    /// the pair has.
     Split,
-    /// One port for both neighbours.
+    /// A ring or line member reaches both neighbours by one port. A mesh
+    /// member uses one port for every other member, as in one island.
     Same,
 }
 
@@ -209,9 +217,15 @@ fn check_set(s: &Set) -> Result<(), String> {
             "set {name:?}: unknown layout \"hops\", expected mesh, ring, line, star or any"
         ));
     }
-    if s.ports != Ports::Auto && !matches!(s.layout, Layout::Ring | Layout::Line | Layout::Any) {
+    if s.ports != Ports::Auto && s.layout == Layout::Star {
         return Err(format!(
-            "set {name:?}: ports applies to a ring, a line or any"
+            "set {name:?}: ports applies to a mesh, a ring, a line or any"
+        ));
+    }
+    if s.ports == Ports::Split && s.layout == Layout::Mesh && s.bundles.len() > MAX_SPLIT_MEMBERS {
+        return Err(format!(
+            "set {name:?}: a split mesh has at most {MAX_SPLIT_MEMBERS} nodes, got {}",
+            s.bundles.len()
         ));
     }
     // Only one hop for now. A longer path relays through more boxes whose

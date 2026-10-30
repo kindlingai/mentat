@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="170" viewBox="0 0 480 170" role="img"><title>mesh ports: same keeps every pair on the switch; split moves the 0-1 pair to its cable</title><style>
+.n{fill:#ffffff;stroke:#57606a;stroke-width:1.5}
+.h{fill:#ddf4ff;stroke:#0969da;stroke-width:1.5}
+.t{fill:#1f2328;font:12px sans-serif;text-anchor:middle;dominant-baseline:central}
+.c{fill:#57606a;font:11px sans-serif;text-anchor:middle}
+.l{stroke:#57606a;stroke-width:2;fill:none}
+.sw{stroke:#0969da;stroke-width:2;fill:none}
+.cb{stroke:#bc4c00;stroke-width:3;fill:none}
+.d{stroke:#8c959f;stroke-width:1.5;stroke-dasharray:4 3;fill:none}
+.box{fill:#f6f8fa;stroke:#0969da;stroke-width:1.5}
+.g{fill:none;stroke:#8c959f;stroke-width:1;stroke-dasharray:3 3}
+@media (prefers-color-scheme: dark){
+.n{fill:#0d1117;stroke:#9198a1}
+.h{fill:#0c2d6b;stroke:#4493f8}
+.t{fill:#f0f6fc}
+.c{fill:#9198a1}
+.l{stroke:#9198a1}
+.sw{stroke:#4493f8}
+.cb{stroke:#f0883e}
+.d{stroke:#656c76}
+.box{fill:#161b22;stroke:#4493f8}
+.g{stroke:#656c76}
+}
+</style><rect class="box" x="90" y="65" width="60" height="30" rx="4"/><text class="t" x="120" y="80">switch</text><line class="sw" x1="35" y1="35" x2="90" y2="70"/><line class="sw" x1="35" y1="125" x2="90" y2="90"/><line class="sw" x1="205" y1="125" x2="150" y2="90"/><line class="sw" x1="205" y1="35" x2="150" y2="70"/><line class="g" x1="35" y1="35" x2="35" y2="125"/><circle class="n" cx="35" cy="35" r="15"/><text class="t" x="35" y="35">0</text><circle class="n" cx="35" cy="125" r="15"/><text class="t" x="35" y="125">1</text><circle class="n" cx="205" cy="125" r="15"/><text class="t" x="205" y="125">2</text><circle class="n" cx="205" cy="35" r="15"/><text class="t" x="205" y="35">3</text><text class="c" x="120" y="158">mesh, ports: same (default)</text><text class="c" x="57" y="84"></text><rect class="box" x="330" y="65" width="60" height="30" rx="4"/><text class="t" x="360" y="80">switch</text><line class="sw" x1="275" y1="35" x2="330" y2="70"/><line class="sw" x1="275" y1="125" x2="330" y2="90"/><line class="sw" x1="445" y1="125" x2="390" y2="90"/><line class="sw" x1="445" y1="35" x2="390" y2="70"/><line class="cb" x1="275" y1="35" x2="275" y2="125"/><circle class="n" cx="275" cy="35" r="15"/><text class="t" x="275" y="35">0</text><circle class="n" cx="275" cy="125" r="15"/><text class="t" x="275" y="125">1</text><circle class="n" cx="445" cy="125" r="15"/><text class="t" x="445" y="125">2</text><circle class="n" cx="445" cy="35" r="15"/><text class="t" x="445" y="35">3</text><text class="c" x="360" y="158">mesh, ports: split</text><text class="c" x="297" y="84">0-1</text></svg>

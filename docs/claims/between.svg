@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="280" height="130" viewBox="0 0 280 130" role="img"><title>between: two rdma sets with an ip link between them</title><style>
+.n{fill:#ffffff;stroke:#57606a;stroke-width:1.5}
+.h{fill:#ddf4ff;stroke:#0969da;stroke-width:1.5}
+.t{fill:#1f2328;font:12px sans-serif;text-anchor:middle;dominant-baseline:central}
+.c{fill:#57606a;font:11px sans-serif;text-anchor:middle}
+.l{stroke:#57606a;stroke-width:2;fill:none}
+.sw{stroke:#0969da;stroke-width:2;fill:none}
+.cb{stroke:#bc4c00;stroke-width:3;fill:none}
+.d{stroke:#8c959f;stroke-width:1.5;stroke-dasharray:4 3;fill:none}
+.box{fill:#f6f8fa;stroke:#0969da;stroke-width:1.5}
+.g{fill:none;stroke:#8c959f;stroke-width:1;stroke-dasharray:3 3}
+@media (prefers-color-scheme: dark){
+.n{fill:#0d1117;stroke:#9198a1}
+.h{fill:#0c2d6b;stroke:#4493f8}
+.t{fill:#f0f6fc}
+.c{fill:#9198a1}
+.l{stroke:#9198a1}
+.sw{stroke:#4493f8}
+.cb{stroke:#f0883e}
+.d{stroke:#656c76}
+.box{fill:#161b22;stroke:#4493f8}
+.g{stroke:#656c76}
+}
+</style><rect class="g" x="15" y="30" width="110" height="60" rx="8"/><rect class="g" x="155" y="30" width="110" height="60" rx="8"/><line class="cb" x1="40" y1="60" x2="100" y2="60"/><line class="cb" x1="180" y1="60" x2="240" y2="60"/><line class="d" x1="100" y1="60" x2="180" y2="60"/><circle class="n" cx="40" cy="60" r="15"/><text class="t" x="40" y="60">0</text><circle class="n" cx="100" cy="60" r="15"/><text class="t" x="100" y="60">1</text><circle class="n" cx="180" cy="60" r="15"/><text class="t" x="180" y="60">0</text><circle class="n" cx="240" cy="60" r="15"/><text class="t" x="240" y="60">1</text><text class="c" x="70" y="22">tp0: rdma</text><text class="c" x="210" y="22">tp1: rdma</text><text class="c" x="140" y="52">ip</text><text class="c" x="140" y="118">between tp0 and tp1</text></svg>

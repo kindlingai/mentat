@@ -9,15 +9,16 @@ use crate::shape::Layout;
 use crate::NodeId;
 
 /// Where each set landed, and the links the answer rests on.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct View {
     /// Each set's members. A ring, a line or a star lists them in rank order.
     pub sets: BTreeMap<String, Vec<Member>>,
     /// One link per `between` entry, in request order.
     pub between: Vec<BetweenLink>,
-    /// For each ring, line, star or `any` set, every probed link between two
-    /// members that meets the set's `link`, with no forwarding box between.
+    /// For each ring, line, star, `any` or `split` mesh set, every probed
+    /// link between two members that meets the set's `link`, with no
+    /// forwarding box between.
     pub links: BTreeMap<String, Vec<LinkFact>>,
     /// For each ring, line, star or `any` set, every fewest-hop path through
     /// its members between two members with no link. Keyed by the first
@@ -92,12 +93,15 @@ pub struct BetweenEnd {
 }
 
 /// One link between two members, with `a` the lower node id.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LinkFact {
     pub a: LinkEnd,
     pub b: LinkEnd,
     pub rtt_ms: u64,
+    /// In a `split` mesh, the fraction of the pair's traffic on this link. A pair's shares add up to 1, and 0 marks a link left unused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share: Option<f64>,
 }
 
 /// One end of a link between two members.
