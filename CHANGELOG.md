@@ -2,7 +2,7 @@
 
 The protocol stays at 0.99 in every release below.
 
-## Unreleased
+## 0.26.0 (2026-10-30)
 
 ### Added
 
@@ -11,7 +11,9 @@ The protocol stays at 0.99 in every release below.
   between the pair, so a cabled pair uses its cable before the switch. The
   solver picks the node set whose busiest port carries the least, so a
   `split` mesh of two takes a cabled pair. Each `links` row of a `split`
-  mesh carries a `share`. A `split` mesh has at most 64 members.
+  mesh carries a `share`. A `split` mesh has at most 64 members. The head
+  solves every claim, and an older head refuses `ports` on a mesh, so every
+  daemon needs the update.
 - The README lists the claim layouts and options, with diagrams.
 
 ## 0.25.0 (2026-10-25)
