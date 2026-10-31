@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex};
 
 use serde_json::{json, Value};
@@ -23,23 +24,40 @@ pub type NodeId = String;
 #[derive(Clone)]
 pub struct FrameWriter {
     inner: Arc<Mutex<TcpStream>>,
+    /// The socket in `inner`, which lives as long as any clone of this.
+    fd: RawFd,
 }
 
 impl FrameWriter {
     pub fn new(stream: TcpStream) -> Self {
         FrameWriter {
+            fd: stream.as_raw_fd(),
             inner: Arc::new(Mutex::new(stream)),
         }
     }
 
+    /// A failed write shuts the socket. A frame cut short leaves the stream
+    /// unframed, and a timed-out write means the peer stopped reading.
     pub fn send(&self, msg: Msg, req: u64, payload: &[u8]) -> std::io::Result<()> {
         let mut s = self.inner.lock().unwrap();
-        write_frame(&mut *s, &Frame::new(req, msg), payload)
+        let r = write_frame(&mut *s, &Frame::new(req, msg), payload);
+        if r.is_err() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        r
     }
 
+    /// Writes that make no progress for `d` fail, and the socket shuts.
+    pub fn set_write_timeout(&self, d: std::time::Duration) {
+        let _ = self.inner.lock().unwrap().set_write_timeout(Some(d));
+    }
+
+    /// Callable with the state lock held. It skips the write lock, which a
+    /// send to a peer whose kernel advertises a zero window holds forever,
+    /// and shutting the socket ends that send.
     pub fn shutdown(&self) {
-        if let Ok(s) = self.inner.lock() {
-            let _ = s.shutdown(std::net::Shutdown::Both);
+        unsafe {
+            libc::shutdown(self.fd, libc::SHUT_RDWR);
         }
     }
 
@@ -638,4 +656,62 @@ pub fn write_json_file(path: &str, value: &Value) -> std::io::Result<()> {
     f.flush()?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// A writer to a peer that accepts the connection and never reads.
+    fn stalled_peer() -> (FrameWriter, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let s = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (held, _) = l.accept().unwrap();
+        (FrameWriter::new(s), held)
+    }
+
+    fn big_send(w: &FrameWriter) -> mpsc::Receiver<std::io::Result<()>> {
+        let (tx, rx) = mpsc::channel();
+        let w = w.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(w.send(Msg::Ping, 0, &vec![0u8; 64 << 20]));
+        });
+        rx
+    }
+
+    // Regression: the staleness sweeper froze the daemon, state lock held,
+    // waiting on the write lock of a send stuck on a zero window.
+    #[test]
+    fn shutdown_ends_a_stuck_send_without_waiting_for_it() {
+        let (w, _held) = stalled_peer();
+        let sent = big_send(&w);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(sent.try_recv().is_err(), "the send should be stuck");
+        let (tx, shut) = mpsc::channel();
+        let w2 = w.clone();
+        std::thread::spawn(move || {
+            w2.shutdown();
+            let _ = tx.send(());
+        });
+        shut.recv_timeout(Duration::from_secs(5))
+            .expect("shutdown waited for the stuck send");
+        let r = sent
+            .recv_timeout(Duration::from_secs(5))
+            .expect("send still stuck");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn a_timed_out_send_shuts_the_socket() {
+        let (w, _held) = stalled_peer();
+        w.set_write_timeout(Duration::from_millis(200));
+        let r = big_send(&w)
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the write timeout did not fire");
+        assert!(r.is_err());
+        assert!(w.send(Msg::Ping, 0, &[]).is_err());
+    }
 }

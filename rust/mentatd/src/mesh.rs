@@ -470,6 +470,13 @@ fn register_peer(shared: &SharedRef, p: PeerIdent, writer: FrameWriter) -> bool 
         control_port,
         http_port,
     } = p;
+    // The status pusher writes to each peer in turn, and events go out with
+    // the state lock held. A peer that stops reading but whose kernel still
+    // ACKs never times out in TCP, so its writes get a deadline well inside
+    // the stale window.
+    writer.set_write_timeout(Duration::from_millis(
+        (cfg().peer_stale_after_ms / 4).max(1000),
+    ));
     let mut st = shared.st.lock().unwrap();
     let my_id = st.node_id.clone();
     let dialer = |outbound: bool| if outbound { &my_id } else { &node_id };
