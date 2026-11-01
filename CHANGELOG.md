@@ -2,6 +2,17 @@
 
 The protocol stays at 0.99 in every release below.
 
+## 0.27.0 (2026-10-31)
+
+### Fixed
+
+- A peer whose daemon stops reading while its kernel still answers no
+  longer freezes the daemons that write to it. The write to that peer
+  blocked forever, and declaring the peer dead waited behind it with the
+  state lock held, until the peer rebooted. A write to a peer that makes
+  no progress for a quarter of `MENTAT_PEER_STALE_AFTER_MS` (7.5 s by
+  default) now drops the link, and the connector dials again.
+
 ## 0.26.0 (2026-10-30)
 
 ### Added
